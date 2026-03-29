@@ -50,6 +50,8 @@ type PendingApproval = {
   id: string
   chatId: number
   text: string
+  sessionID?: string
+  permissionID?: string
   decision?: "deny" | "once" | "always"
   resolve: (v: "deny" | "once" | "always") => void
   timer: ReturnType<typeof setTimeout>
@@ -318,9 +320,10 @@ export const TelegramPlugin: Plugin = async (ctx) => {
 
   // ─── 輔助：發訊息 ───────────────────────────────────────────────────────
 
-  async function sendMsg(chatId: number, text: string, extra?: Record<string, unknown>): Promise<number | undefined> {
+  async function sendMsg(chatId: number, text: string | string[], extra?: Record<string, unknown>): Promise<number | undefined> {
     if (!token) return undefined
-    const chunks = splitText(text)
+    const normalized = Array.isArray(text) ? text.join("\n") : text
+    const chunks = splitText(normalized)
     let lastMsgId: number | undefined
     for (const chunk of chunks) {
       const res = await tgPost(token, "sendMessage", {
@@ -461,12 +464,104 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     const item = pendingApprovals.get(id)
     if (!item) return false
     clearTimeout(item.timer)
-    item.decision = decision
-    item.resolve(decision)
     pendingApprovals.delete(id)
     state.approvals[id] = { id, decision, createdAt: item.createdAt, resolvedAt: now() }
     await persist()
+
+    if (item.sessionID && item.permissionID) {
+      const response = decision === "deny" ? "reject" : decision
+      const method = (client as any).postSessionIdPermissionsPermissionId
+      if (typeof method === "function") {
+        const attempts = [
+          { path: { id: item.sessionID, permissionID: item.permissionID }, body: { response } },
+          { path: { id: item.sessionID, permissionID: item.permissionID }, body: { response, }, },
+        ]
+        let lastErr: unknown
+        for (const options of attempts) {
+          try {
+            await method.call(client, options)
+            await log(`permission.reply sent id=${id} session=${item.sessionID} permission=${item.permissionID} response=${response}`)
+            break
+          } catch (err) {
+            lastErr = err
+          }
+        }
+        if (lastErr) {
+          await log(`permission.reply error id=${id}: ${summarizeError(lastErr)}`)
+        }
+      }
+    }
+
+    item.resolve(decision)
     return true
+  }
+
+  async function handlePermissionAsked(raw: any) {
+    const props = raw?.properties ?? raw
+    const perm = props?.permission && typeof props.permission === "string"
+      ? props
+      : (props?.permission ?? props)
+
+    const permID = props?.id ?? perm?.id ?? uid("perm")
+    const permType = props?.permission ?? perm?.type ?? "permission"
+    const title = props?.title ?? perm?.title ?? permType
+    const sessionID = props?.sessionID ?? perm?.sessionID ?? perm?.sessionId
+    const callID = props?.tool?.callID ?? props?.callID ?? perm?.callID
+    const patterns = Array.isArray(props?.patterns) ? props.patterns : Array.isArray(perm?.pattern) ? perm.pattern : []
+    const pattern = patterns.length ? patterns.join(", ") : (perm?.pattern ?? "")
+
+    const ruleKey = JSON.stringify({ permType, pattern, sessionID })
+    const cached = state.permissionRules[ruleKey]
+    if (cached === "always") return
+    if (cached === "deny") return
+
+    const chatId = currentChatId ?? [...allowChatIds][0]
+    if (!chatId) {
+      await log(`permission.asked: no chatId available, denying. type=${permType}`)
+      return
+    }
+
+    const id = uid("apr")
+    const msgLines = [
+      `🔐 需要授權`,
+      `id: \`${id}\``,
+      `permissionID: ${permID}`,
+      sessionID ? `session: ${sessionID}` : undefined,
+      callID ? `call: ${callID}` : undefined,
+      `類型: ${permType}`,
+      patterns.length ? `patterns: ${patterns.join(" | ")}` : undefined,
+      title !== permType ? `說明: ${title}` : undefined,
+      pattern ? `pattern: ${pattern}` : undefined,
+    ].filter(Boolean).join("\n")
+
+    await log(`permission.asked id=${id} type=${permType} title=${title}`)
+    await log(`permission.asked raw=${JSON.stringify(raw).slice(0, 1000)}`)
+    await log(`permission.asked payload session=${sessionID} call=${callID} pattern=${pattern} message=${JSON.stringify(perm).slice(0, 400)}`)
+
+    const timer = setTimeout(() => {
+      void resolveApproval(id, "deny")
+    }, requestTimeoutMs)
+
+    pendingApprovals.set(id, {
+      id,
+      chatId,
+      text: msgLines,
+      sessionID,
+      permissionID: permID,
+      resolve: () => undefined,
+      timer,
+      createdAt: now(),
+    })
+
+    void sendMsg(chatId, msgLines, {
+      reply_markup: {
+        inline_keyboard: [[
+          btn("拒絕", `approval:${id}:deny`),
+          btn("允許一次", `approval:${id}:once`),
+          btn("永遠允許", `approval:${id}:always`),
+        ]],
+      },
+    }).catch(err => void log(`permission.asked sendMsg error: ${summarizeError(err)}`))
   }
 
   // ─── TG 指令處理 ────────────────────────────────────────────────────────
@@ -707,6 +802,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       const match = cbData.match(/^approval:([^:]+):(deny|once|always)$/)
       if (match) {
         const [, id, decision] = match
+        await log(`callback approval id=${id} decision=${decision} cbChatId=${cbChatId}`)
         await resolveApproval(id, decision as "deny" | "once" | "always")
         await answerCallback(update.callback_query!.id, `已回覆: ${decision}`)
       }
@@ -802,9 +898,16 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       }
 
       // Log only non-trivial events (skip high-frequency noise)
-      const quietEvents = new Set(["file.watcher.updated", "session.status", "todo.updated"])
+      const quietEvents = new Set(["file.watcher.updated", "session.status", "todo.updated", "message.part.delta"])
       if (!quietEvents.has(event?.type as string)) {
         await log(`event: ${event?.type}`)
+      }
+
+      if (event?.type === "permission.asked") {
+        await handlePermissionAsked(event).catch(err =>
+          log(`permission.asked error: ${summarizeError(err)}`)
+        )
+        return
       }
 
       if (event?.type === "session.created" || event?.type === "session.updated") {
@@ -861,85 +964,17 @@ export const TelegramPlugin: Plugin = async (ctx) => {
      * Permission 型別（來自 @opencode-ai/sdk）：
      *   { id, type, title, sessionID, messageID, callID?, pattern?, metadata, time }
      */
+    async permissionHandler(inputPermission, output) {
+      await handlePermissionAsked(inputPermission)
+      output.status = "ask"
+    },
+
+    async "permission.asked"(inputPermission, output) {
+      return this.permissionHandler(inputPermission, output)
+    },
+
     async "permission.ask"(inputPermission, output) {
-      const perm = inputPermission as any
-      // Use the actual SDK Permission fields
-      const permID   = perm?.id ?? uid("perm")
-      const permType = perm?.type ?? "permission"
-      const title    = perm?.title ?? permType
-      const sessionID = perm?.sessionID
-      const callID   = perm?.callID
-      const pattern  = Array.isArray(perm?.pattern)
-        ? perm.pattern.join(", ")
-        : (perm?.pattern ?? "")
-
-      // 檢查快取規則（以 permType + pattern + sessionID 作為 key）
-      const ruleKey = JSON.stringify({ permType, pattern, sessionID })
-      const cached = state.permissionRules[ruleKey]
-      if (cached === "always") {
-        output.status = "allow"
-        return
-      }
-      if (cached === "deny") {
-        output.status = "deny"
-        return
-      }
-
-      const chatId = currentChatId ?? [...allowChatIds][0]
-      if (!chatId) {
-        await log(`permission.ask: no chatId available, denying. type=${permType}`)
-        output.status = "deny"
-        return
-      }
-
-      const id = uid("apr")
-      const msgLines = [
-        `🔐 需要授權`,
-        `id: \`${id}\``,
-        `permissionID: ${permID}`,
-        sessionID ? `session: ${sessionID}` : undefined,
-        callID    ? `call: ${callID}` : undefined,
-        `類型: ${permType}`,
-        title !== permType ? `說明: ${title}` : undefined,
-        pattern   ? `pattern: ${pattern}` : undefined,
-      ].filter(Boolean).join("\n")
-
-      await log(`permission.ask id=${id} type=${permType} title=${title}`)
-
-      const decision = await new Promise<"deny" | "once" | "always">((resolve) => {
-        const timer = setTimeout(() => {
-          pendingApprovals.delete(id)
-          resolve("deny")
-        }, requestTimeoutMs)
-
-        pendingApprovals.set(id, {
-          id,
-          chatId,
-          text: msgLines,
-          resolve,
-          timer,
-          createdAt: now(),
-        })
-
-        void sendMsg(chatId, msgLines, {
-          reply_markup: {
-            inline_keyboard: [[
-              btn("拒絕", `approval:${id}:deny`),
-              btn("允許一次", `approval:${id}:once`),
-              btn("永遠允許", `approval:${id}:always`),
-            ]],
-          },
-        })
-      })
-
-      await log(`permission.ask resolved id=${id} decision=${decision}`)
-
-      if (decision === "always") {
-        state.permissionRules[ruleKey] = "always"
-        await persist()
-      }
-
-      output.status = decision === "deny" ? "deny" : "allow"
+      return this.permissionHandler(inputPermission, output)
     },
   }
 }
