@@ -347,7 +347,12 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       message_id: messageId,
       text: text.slice(0, 4000),
       ...extra,
-    }).catch(err => void log(`editMsg error: ${err?.message}`))
+    }).catch(err => {
+      const msg = err?.message ?? String(err)
+      if (!msg.includes("message is not modified")) {
+        void log(`editMsg error: ${msg}`)
+      }
+    })
   }
 
   async function answerCallback(callbackQueryId: string, text?: string) {
@@ -395,7 +400,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
 
     const finalText = ss.buffer || "(任務完成，無文字回覆)"
     if (ss.messageId) {
-      await editMsg(ss.chatId, finalText)
+      await editMsg(ss.chatId, ss.messageId, finalText)
     } else {
       await sendMsg(ss.chatId, finalText)
     }
@@ -472,22 +477,14 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       const response = decision === "deny" ? "reject" : decision
       const method = (client as any).postSessionIdPermissionsPermissionId
       if (typeof method === "function") {
-        const attempts = [
-          { path: { id: item.sessionID, permissionID: item.permissionID }, body: { response } },
-          { path: { id: item.sessionID, permissionID: item.permissionID }, body: { response, }, },
-        ]
-        let lastErr: unknown
-        for (const options of attempts) {
-          try {
-            await method.call(client, options)
-            await log(`permission.reply sent id=${id} session=${item.sessionID} permission=${item.permissionID} response=${response}`)
-            break
-          } catch (err) {
-            lastErr = err
-          }
-        }
-        if (lastErr) {
-          await log(`permission.reply error id=${id}: ${summarizeError(lastErr)}`)
+        try {
+          await method.call(client, {
+            path: { id: item.sessionID, permissionID: item.permissionID },
+            body: { response },
+          })
+          await log(`permission.reply sent id=${id} session=${item.sessionID} permission=${item.permissionID} response=${response}`)
+        } catch (err) {
+          await log(`permission.reply error id=${id}: ${summarizeError(err)}`)
         }
       }
     }
@@ -496,28 +493,31 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     return true
   }
 
-  async function handlePermissionAsked(raw: any) {
+  async function handlePermissionAsked(raw: any, output?: { status: "ask" | "deny" | "allow" }) {
     const props = raw?.properties ?? raw
-    const perm = props?.permission && typeof props.permission === "string"
-      ? props
-      : (props?.permission ?? props)
-
-    const permID = props?.id ?? perm?.id ?? uid("perm")
-    const permType = props?.permission ?? perm?.type ?? "permission"
-    const title = props?.title ?? perm?.title ?? permType
-    const sessionID = props?.sessionID ?? perm?.sessionID ?? perm?.sessionId
-    const callID = props?.tool?.callID ?? props?.callID ?? perm?.callID
-    const patterns = Array.isArray(props?.patterns) ? props.patterns : Array.isArray(perm?.pattern) ? perm.pattern : []
-    const pattern = patterns.length ? patterns.join(", ") : (perm?.pattern ?? "")
+    const permID = props?.id ?? uid("perm")
+    const permType = props?.permission ?? "permission"
+    const title = props?.title ?? permType
+    const sessionID = props?.sessionID ?? props?.sessionId
+    const callID = props?.tool?.callID ?? props?.callID
+    const patterns = Array.isArray(props?.patterns) ? props.patterns : []
+    const pattern = patterns.join(", ")
 
     const ruleKey = JSON.stringify({ permType, pattern, sessionID })
     const cached = state.permissionRules[ruleKey]
-    if (cached === "always") return
-    if (cached === "deny") return
+    if (cached === "always") {
+      if (output) output.status = "allow"
+      return
+    }
+    if (cached === "deny") {
+      if (output) output.status = "deny"
+      return
+    }
 
     const chatId = currentChatId ?? [...allowChatIds][0]
     if (!chatId) {
       await log(`permission.asked: no chatId available, denying. type=${permType}`)
+      if (output) output.status = "deny"
       return
     }
 
@@ -535,8 +535,6 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     ].filter(Boolean).join("\n")
 
     await log(`permission.asked id=${id} type=${permType} title=${title}`)
-    await log(`permission.asked raw=${JSON.stringify(raw).slice(0, 1000)}`)
-    await log(`permission.asked payload session=${sessionID} call=${callID} pattern=${pattern} message=${JSON.stringify(perm).slice(0, 400)}`)
 
     const timer = setTimeout(() => {
       void resolveApproval(id, "deny")
@@ -562,6 +560,8 @@ export const TelegramPlugin: Plugin = async (ctx) => {
         ]],
       },
     }).catch(err => void log(`permission.asked sendMsg error: ${summarizeError(err)}`))
+
+    if (output) output.status = "ask"
   }
 
   // ─── TG 指令處理 ────────────────────────────────────────────────────────
@@ -964,17 +964,12 @@ export const TelegramPlugin: Plugin = async (ctx) => {
      * Permission 型別（來自 @opencode-ai/sdk）：
      *   { id, type, title, sessionID, messageID, callID?, pattern?, metadata, time }
      */
-    async permissionHandler(inputPermission, output) {
-      await handlePermissionAsked(inputPermission)
-      output.status = "ask"
-    },
-
     async "permission.asked"(inputPermission, output) {
-      return this.permissionHandler(inputPermission, output)
+      await handlePermissionAsked(inputPermission, output)
     },
 
     async "permission.ask"(inputPermission, output) {
-      return this.permissionHandler(inputPermission, output)
+      await handlePermissionAsked(inputPermission, output)
     },
   }
 }
