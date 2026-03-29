@@ -430,14 +430,14 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       done: false,
     })
 
-    await log(`runPrompt sid=${sessionId} model=${model ?? "(default)"}`)
-
     // 解析 model
     let modelObj: any = undefined
     if (model) {
       const slash = model.indexOf("/")
       if (slash > 0) {
         modelObj = { providerID: model.slice(0, slash), modelID: model.slice(slash + 1) }
+      } else {
+        await log(`runPrompt invalid model format: ${model}`)
       }
     }
 
