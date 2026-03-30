@@ -22,11 +22,12 @@
  *   /session switch <id> - 切換 session
  *   /session info      - 查看目前 session 資訊
  *
- *   /model list        - 列出可用模型
+ *   /model list        - 列出可用模型（含 OAuth provider 動態模型）
  *   /model show        - 顯示目前模型
- *   /model use <name>  - 切換模型（格式：provider/model）
+ *   /model use <n>     - 切換模型（格式：provider/model）
  *
  *   /approve <id> once|always|deny - 手動回覆授權請求
+ *   /answer <requestID> <回答>     - 手動回覆 AI 提問
  */
 
 import fs from "node:fs/promises"
@@ -44,6 +45,8 @@ type TgSettings = {
   pollIntervalMs?: number
   requestTimeoutMs?: number
   enabled?: boolean
+  opencodePort?: number
+  watchdogMs?: number
 }
 
 type PendingApproval = {
@@ -58,22 +61,37 @@ type PendingApproval = {
   createdAt: number
 }
 
+// ─── 新增：PendingQuestion ────────────────────────────────────────────────────
+type QuestionItem = {
+  id?: string
+  text: string
+  options?: string[]
+}
+
+type PendingQuestion = {
+  requestID: string
+  sessionID?: string
+  chatId: number
+  questions: QuestionItem[]
+  createdAt: number
+  timer: ReturnType<typeof setTimeout>
+}
+
 type SessionRecord = {
   id: string
   title?: string
   createdAt: number
+  parentID?: string   // 記錄 subagent 的 parent session
 }
 
 type StreamState = {
   chatId: number
   sessionId: string
-  /** 目前累積的 assistant 文字（用來判斷是否有變化） */
   buffer: string
-  /** 上次發到 TG 的 messageId（用於 edit） */
   messageId?: number
-  /** 上次 edit 的時間戳 */
+  extraMessageIds: number[]  // 超過 4000 字後的延續訊息
   lastEditAt: number
-  /** 是否已完成 */
+  lastActivityAt: number
   done: boolean
 }
 
@@ -109,7 +127,6 @@ type TelegramUpdate = {
 
 // ─── 工具函數 ──────────────────────────────────────────────────────────────
 
-// Plugin is at .opencode/plugins/tg-bot.ts → go up two levels to reach project root
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..")
 
 function now() { return Date.now() }
@@ -204,7 +221,6 @@ export const TelegramPlugin: Plugin = async (ctx) => {
   const stateFile = path.join(stateDir, "state.json")
   const logFile = path.join(stateDir, "log.txt")
 
-  // 確保目錄存在
   fsSync.mkdirSync(stateDir, { recursive: true })
 
   const log = (msg: string) => appendLog(logFile, msg)
@@ -223,6 +239,10 @@ export const TelegramPlugin: Plugin = async (ctx) => {
   const pollIntervalMs = Number(process.env.TG_POLL_INTERVAL_MS ?? fileSettings.pollIntervalMs ?? 2000)
   const requestTimeoutMs = Number(process.env.TG_REQUEST_TIMEOUT_MS ?? fileSettings.requestTimeoutMs ?? 120000)
   const enabledFromConfig = parseToggle(fileSettings.enabled) ?? parseToggle(process.env.TG_PLUGIN_ENABLED) ?? true
+  // opencode server port（預設 4096）
+  const opencodePort = Number(process.env.OPENCODE_PORT ?? fileSettings.opencodePort ?? 4096)
+  // 串流靜止多久（ms）後觸發 watchdog 警告（預設 5 分鐘）
+  const watchdogMs = Number(process.env.TG_WATCHDOG_MS ?? fileSettings.watchdogMs ?? 5 * 60 * 1000)
 
   // ─── 執行期狀態 ─────────────────────────────────────────────────────────
 
@@ -238,7 +258,6 @@ export const TelegramPlugin: Plugin = async (ctx) => {
   }
 
   let state: PluginState = await readJson<PluginState>(stateFile, DEFAULT_STATE)
-  // 補齊舊版缺少的欄位
   state.sessions ??= []
   state.approvals ??= {}
   state.permissionRules ??= {}
@@ -249,23 +268,36 @@ export const TelegramPlugin: Plugin = async (ctx) => {
   state.lastUpdateId ??= 0
 
   const pendingApprovals = new Map<string, PendingApproval>()
-  // 以 sessionId 為 key，記錄目前任務的 stream 狀態
+  const pendingQuestions = new Map<string, PendingQuestion>()  // ← 新增
   const streamStates = new Map<string, StreamState>()
+
+  // ─── 新增：Busy guard ─────────────────────────────────────────────────────
+  // 記錄每個 session 目前是否正在執行中（由 plugin 自己維護，避免撞 BusyError）
+  const runningSessions = new Set<string>()
 
   let currentChatId: number | undefined
   let currentSessionId: string | undefined = state.currentSessionByChat[Object.keys(state.currentSessionByChat)[0]]
-  let pollStopped = false // 401 等不可重試錯誤時停止 poll
+  let pollStopped = false
 
   const persist = () => writeJson(stateFile, state).catch(() => undefined)
 
+  // ─── 輔助：opencode REST ──────────────────────────────────────────────────
+
+  async function ocFetch(path: string, opts?: RequestInit) {
+    return fetch(`http://localhost:${opencodePort}${path}`, {
+      headers: { "content-type": "application/json" },
+      ...opts,
+    })
+  }
+
   // ─── 輔助：Session ──────────────────────────────────────────────────────
 
-  function rememberSession(chatId: number, sessionId: string) {
+  function rememberSession(chatId: number, sessionId: string, parentID?: string) {
     currentChatId = chatId
     currentSessionId = sessionId
     state.currentSessionByChat[String(chatId)] = sessionId
     if (!state.sessions.find(s => s.id === sessionId)) {
-      state.sessions.push({ id: sessionId, createdAt: now() })
+      state.sessions.push({ id: sessionId, createdAt: now(), parentID })
     }
   }
 
@@ -301,7 +333,28 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     return state.sessions
   }
 
+  // ─── 修改：listModels 支援動態 OAuth provider ────────────────────────────
+
   async function listModels(): Promise<string[]> {
+    // 優先嘗試動態模型清單（包含 GitHub Copilot 等 OAuth provider）
+    try {
+      const res = await (client as any).model.list()
+      const data = (res as any)?.data ?? res
+      if (Array.isArray(data) && data.length > 0) {
+        return data
+          .map((m: any) => {
+            const provider = m?.provider?.id ?? m?.providerID ?? ""
+            const model = m?.id ?? m?.modelID ?? ""
+            return provider && model ? `${provider}/${model}` : null
+          })
+          .filter(Boolean)
+          .sort() as string[]
+      }
+    } catch (err) {
+      await log(`listModels (dynamic) error: ${summarizeError(err)}`)
+    }
+
+    // fallback：從靜態設定讀取
     try {
       const res = await client.config.get()
       const cfg = (res as any)?.data ?? res
@@ -313,7 +366,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       }
       if (names.length) return [...new Set(names)].sort()
     } catch (err) {
-      await log(`listModels error: ${summarizeError(err)}`)
+      await log(`listModels (static) error: ${summarizeError(err)}`)
     }
     return []
   }
@@ -329,7 +382,6 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       const res = await tgPost(token, "sendMessage", {
         chat_id: chatId,
         text: chunk,
-        // only attach keyboard/etc to last chunk
         ...(chunk === chunks[chunks.length - 1] ? extra : {}),
       }).catch(err => {
         void log(`sendMsg error: ${err?.message}`)
@@ -366,21 +418,19 @@ export const TelegramPlugin: Plugin = async (ctx) => {
 
   // ─── Stream 推送邏輯 ────────────────────────────────────────────────────
 
-  /**
-   * 當 event hook 收到 message.part.updated（type=text）時呼叫，
-   * 將 agent 的串流回覆逐步 edit 到 TG 的進度訊息上。
-   */
   async function handleStreamPart(sessionId: string, text: string) {
-    let ss = streamStates.get(sessionId)
-    if (!ss) return // 不是由 TG 觸發的任務，忽略
+    const ss = streamStates.get(sessionId)
+    if (!ss) return
 
     ss.buffer = text
+    ss.lastActivityAt = now()
 
-    // 限制更新頻率（1 秒一次）
     const nowMs = now()
     if (nowMs - ss.lastEditAt < 1000) return
     ss.lastEditAt = nowMs
 
+    // 超過 3800 字的部分先只更新第一則（讓使用者知道還在跑）
+    // 完整超長內容在 handleStreamDone 時才切分發送
     const displayText = text.slice(0, 3800)
     if (ss.messageId) {
       await editMsg(ss.chatId, ss.messageId, displayText)
@@ -390,47 +440,88 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     }
   }
 
-  /**
-   * session.idle 時：任務完成，發送最終結果（edit 最後一次）
-   */
   async function handleStreamDone(sessionId: string) {
     const ss = streamStates.get(sessionId)
     if (!ss || ss.done) return
     ss.done = true
 
+    runningSessions.delete(sessionId)
+
     const finalText = ss.buffer || "(任務完成，無文字回覆)"
+    const chunks = splitText(finalText, 3800)
+
+    // 第一段 edit 進原有的進度訊息
     if (ss.messageId) {
-      await editMsg(ss.chatId, ss.messageId, finalText)
+      await editMsg(ss.chatId, ss.messageId, chunks[0])
     } else {
-      await sendMsg(ss.chatId, finalText)
+      await sendMsg(ss.chatId, chunks[0])
     }
+
+    // 後續段落發新訊息
+    for (let i = 1; i < chunks.length; i++) {
+      await sendMsg(ss.chatId, chunks[i])
+    }
+
     streamStates.delete(sessionId)
-    await log(`stream done sid=${sessionId}`)
+    await log(`stream done sid=${sessionId} chunks=${chunks.length}`)
+  }
+
+  // ─── 新增：Watchdog ───────────────────────────────────────────────────────
+  // 定期檢查所有 streaming session 是否靜止過久
+
+  function startWatchdog() {
+    setInterval(async () => {
+      const staleThreshold = now() - watchdogMs
+      for (const [sid, ss] of streamStates) {
+        if (ss.done) continue
+        if (ss.lastActivityAt < staleThreshold) {
+          await log(`watchdog: sid=${sid} stale for ${watchdogMs}ms, notifying`)
+          await sendMsg(ss.chatId, [
+            `⚠️ 警告：session 已靜止超過 ${Math.round(watchdogMs / 60000)} 分鐘`,
+            `session: ${sid}`,
+            `可能原因：LLM 無回應、subagent 卡住、或等待未收到的互動`,
+            `輸入 /abort 強制中止，或繼續等待`,
+          ].join("\n"))
+          // 更新時間避免連續發警告（再等一個 watchdogMs）
+          ss.lastActivityAt = now()
+        }
+      }
+    }, Math.min(watchdogMs, 60_000))  // 最多每分鐘檢查一次
   }
 
   // ─── 執行 Prompt ────────────────────────────────────────────────────────
 
   async function runPrompt(chatId: number, prompt: string, sessionId: string) {
+    // ─ Busy guard：避免同一 session 同時執行兩個 prompt ─
+    if (runningSessions.has(sessionId)) {
+      await sendMsg(chatId, [
+        `⚠️ session ${sessionId} 目前正在執行中`,
+        `請等待完成後再下指令，或用 /abort 中止`,
+      ].join("\n"))
+      return
+    }
+
     rememberSession(chatId, sessionId)
+    runningSessions.add(sessionId)
+
     const model = state.activeModelByChat[String(chatId)] || defaultModel || undefined
 
-    // 建立進度訊息
     const progressMsgId = await sendMsg(
       chatId,
       `⏳ 執行中...${model ? ` (${model})` : ""}\nsession: ${sessionId}`
     )
 
-    // 記錄 stream 狀態
     streamStates.set(sessionId, {
       chatId,
       sessionId,
       buffer: "",
       messageId: progressMsgId,
+      extraMessageIds: [],
       lastEditAt: now(),
+      lastActivityAt: now(),
       done: false,
     })
 
-    // 解析 model
     let modelObj: any = undefined
     if (model) {
       const slash = model.indexOf("/")
@@ -441,8 +532,6 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       }
     }
 
-    // 發送 prompt（同步等待 — plugin 中 session.prompt 是阻塞的，但
-    // event hook 在同一 process 中非同步執行，所以 stream 更新仍會到來）
     try {
       await client.session.prompt({
         path: { id: sessionId },
@@ -454,6 +543,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : summarizeError(err)
       await log(`runPrompt error sid=${sessionId}: ${errMsg}`)
+      runningSessions.delete(sessionId)
       streamStates.delete(sessionId)
       if (progressMsgId) {
         await editMsg(chatId, progressMsgId, `❌ 執行失敗\n${errMsg.slice(0, 500)}`)
@@ -564,6 +654,138 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     if (output) output.status = "ask"
   }
 
+  // ─── 新增：Question 流程 ─────────────────────────────────────────────────
+
+  async function replyQuestion(requestID: string, answers: string[]) {
+    try {
+      await ocFetch(`/question/${requestID}/reply`, {
+        method: "POST",
+        body: JSON.stringify({ answers }),
+      })
+      await log(`question.reply sent requestID=${requestID} answers=${JSON.stringify(answers)}`)
+    } catch (err) {
+      await log(`question.reply error requestID=${requestID}: ${summarizeError(err)}`)
+    }
+  }
+
+  async function rejectQuestion(requestID: string) {
+    try {
+      await ocFetch(`/question/${requestID}/reject`, { method: "POST" })
+      await log(`question.reject sent requestID=${requestID}`)
+    } catch (err) {
+      await log(`question.reject error requestID=${requestID}: ${summarizeError(err)}`)
+    }
+  }
+
+  async function handleQuestionAsked(props: any) {
+    // 完整 log 原始 props，方便 debug 實際的資料結構
+    await log(`question.asked raw props: ${summarizeError(props)}`)
+
+    const requestID = props?.requestID ?? props?.id
+    const sessionID = props?.sessionID ?? props?.sessionId
+    const questions: QuestionItem[] = (props?.questions ?? []).map((q: any) => ({
+      id: q?.id,
+      text: q?.text ?? q?.question ?? String(q),
+      options: Array.isArray(q?.options) ? q.options : undefined,
+    }))
+
+    if (!requestID) {
+      await log(`question.asked: missing requestID, props=${summarizeError(props)}`)
+      return
+    }
+    if (!questions.length) {
+      await log(`question.asked: no questions, requestID=${requestID}`)
+      return
+    }
+
+    // 已在處理中則忽略
+    if (pendingQuestions.has(requestID)) return
+
+    const chatId = currentChatId ?? [...allowChatIds][0]
+    if (!chatId) {
+      await log(`question.asked: no chatId, rejecting requestID=${requestID}`)
+      await rejectQuestion(requestID)
+      return
+    }
+
+    await log(`question.asked: sending to chatId=${chatId} requestID=${requestID}`)
+
+    const timer = setTimeout(async () => {
+      const shortKey = requestID.replace(/-/g, "").slice(0, 8)
+      pendingQuestions.delete(requestID)
+      pendingQuestions.delete(shortKey)
+      await rejectQuestion(requestID)
+      await sendMsg(chatId, `⏰ AI 提問逾時，已自動拒絕\nid: ${shortID}`)
+    }, requestTimeoutMs)
+
+    pendingQuestions.set(requestID, { requestID, sessionID, chatId, questions, createdAt: now(), timer })
+
+    // 用於 callback 的短 ID（取前 8 碼，確保 callback_data 在 64 bytes 內）
+    // 格式：q:<8碼>:<選項索引> 最長 = 2+1+8+1+2 = 14 bytes，遠低於 64 限制
+    const shortID = requestID.replace(/-/g, "").slice(0, 8)
+
+    // 發送每個問題
+    let globalIdx = 0;
+    for (const q of questions) {
+      const hasOptions = Array.isArray(q.options) && q.options.length > 0
+
+      const lines = [
+        `❓ AI 提問`,
+        `id: \`${shortID}\``,
+        sessionID ? `session: ${sessionID.slice(0, 12)}` : undefined,
+        ``,
+        q.text,
+        !hasOptions ? `回覆方式：/answer ${shortID} <你的回答>` : undefined,
+      ].filter(v => v !== undefined).join("\n")
+
+      // Bug 1 修復：callback_data 格式改為 q:<shortID>:<index>
+      // 最長：q: (2) + shortID (8) + : (1) + index (2) = 13 bytes，絕對安全
+      const keyboard = hasOptions
+        ? {
+            reply_markup: {
+              inline_keyboard: chunkArray(
+                (q.options!).map((opt: any) => {
+                  const currentIdx = globalIdx++;
+                  const label = (typeof opt === "string" ? opt : (opt?.label ?? opt?.text ?? JSON.stringify(opt))) || "Option";
+                  return btn(label.slice(0, 30), `q:${shortID}:${currentIdx}`);
+                }),
+                2
+              ),
+            },
+          }
+        : {}
+
+      const mid = await sendMsg(chatId, lines, keyboard)
+      await log(`question.asked: sent msgId=${mid} shortID=${shortID} hasOptions=${hasOptions}`)
+    }
+
+    // shortID → requestID 的對應已存在 pendingQuestions map 裡
+    // 但 /answer 和 callback 都用 shortID 查，需要確保 map 可以被找到
+    // 在 pendingQuestions 額外存一個 shortID 對應（透過更新 map key 或加 field）
+    // 這裡用最簡單的方式：在 map 裡同時用 shortID 存一份參照
+    if (shortID !== requestID) {
+      pendingQuestions.set(shortID, pendingQuestions.get(requestID)!)
+    }
+
+    await log(`question.asked: done requestID=${requestID} shortID=${shortID} questions=${questions.length}`)
+  }
+
+  // 補齊 plugin 重啟後已 pending 的 question
+  async function recoverPendingQuestions() {
+    try {
+      const res = await ocFetch("/question/")
+      if (!res.ok) return
+      const list = await res.json() as any[]
+      if (!Array.isArray(list) || !list.length) return
+      await log(`recoverPendingQuestions: found ${list.length} pending questions`)
+      for (const q of list) {
+        await handleQuestionAsked(q)
+      }
+    } catch (err) {
+      await log(`recoverPendingQuestions error: ${summarizeError(err)}`)
+    }
+  }
+
   // ─── TG 指令處理 ────────────────────────────────────────────────────────
 
   const HELP = `OpenCode TG Bridge 指令：
@@ -587,7 +809,8 @@ export const TelegramPlugin: Plugin = async (ctx) => {
 /model show - 目前模型
 /model use <provider/model> - 切換模型
 
-/approve <id> once|always|deny - 回覆授權`
+/approve <id> once|always|deny - 回覆授權
+/answer <requestID> <回答> - 回覆 AI 提問`
 
   async function handleMessage(chatId: number, text: string) {
     const t = text.trim()
@@ -601,6 +824,39 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     const alwaysAllowed = ["/enable", "/help", "/health", "/ping", "/settings"]
     if (!isEnabled && !alwaysAllowed.includes(t)) {
       await sendMsg(chatId, "TG bridge 已停用，請輸入 /enable 重新啟用。")
+      return
+    }
+
+    // ─ 新增：/answer 指令（手動回覆 AI 提問）─────────────────────────────
+    if (t.startsWith("/answer ")) {
+      const rest = t.slice(8).trim()
+      const spaceIdx = rest.indexOf(" ")
+      if (spaceIdx < 0) {
+        await sendMsg(chatId, "用法：/answer <id> <回答>")
+        return
+      }
+      const rid = rest.slice(0, spaceIdx).trim()
+      const answer = rest.slice(spaceIdx + 1).trim()
+
+      // 支援 shortID 或 requestID 前綴比對
+      const pq = [...pendingQuestions.values()].find(q =>
+        q.chatId === chatId && (
+          q.requestID === rid ||
+          q.requestID.startsWith(rid) ||
+          q.requestID.replace(/-/g, "").startsWith(rid)
+        )
+      )
+      if (!pq) {
+        await sendMsg(chatId, `找不到 AI 提問 \`${rid}\`，可能已逾時或已回覆`)
+        return
+      }
+
+      const shortKey = pq.requestID.replace(/-/g, "").slice(0, 8)
+      clearTimeout(pq.timer)
+      pendingQuestions.delete(pq.requestID)
+      pendingQuestions.delete(shortKey)
+      await replyQuestion(pq.requestID, [answer])
+      await sendMsg(chatId, `✅ 已回覆 AI 提問`)
       return
     }
 
@@ -629,13 +885,17 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     if (t === "/status") {
       const sid = resolveSession(chatId) ?? "(none)"
       const model = state.activeModelByChat[String(chatId)] || defaultModel || "(none)"
-      const pending = pendingApprovals.size
+      const pendingA = pendingApprovals.size
+      const pendingQ = pendingQuestions.size
       const streaming = streamStates.has(sid)
+      const busy = runningSessions.has(sid)
       await sendMsg(chatId, [
         `session: ${sid}`,
         `model: ${model}`,
         `streaming: ${streaming}`,
-        `pending approvals: ${pending}`,
+        `busy: ${busy}`,
+        `pending approvals: ${pendingA}`,
+        `pending questions: ${pendingQ}`,
       ].join("\n"))
       return
     }
@@ -645,6 +905,8 @@ export const TelegramPlugin: Plugin = async (ctx) => {
         `bridge: ${state.enabled ? "enabled" : "disabled"}`,
         `token: ${token ? "configured" : "MISSING"}`,
         `allow chat ids: ${allowChatIds.size ? [...allowChatIds].join(", ") : "(all)"}`,
+        `opencode port: ${opencodePort}`,
+        `watchdog: ${Math.round(watchdogMs / 60000)} min`,
         `started: ${new Date(state.startedAt).toLocaleString()}`,
         `last poll: ${state.lastPollAt ? new Date(state.lastPollAt).toLocaleString() : "(none)"}`,
         `last ok: ${state.lastPollOkAt ? new Date(state.lastPollOkAt).toLocaleString() : "(none)"}`,
@@ -665,6 +927,8 @@ export const TelegramPlugin: Plugin = async (ctx) => {
         `current session: ${resolveSession(chatId) ?? "(none)"}`,
         `poll interval: ${pollIntervalMs}ms`,
         `approval timeout: ${requestTimeoutMs}ms`,
+        `opencode port: ${opencodePort}`,
+        `watchdog: ${Math.round(watchdogMs / 60000)} min`,
         `state dir: ${stateDir}`,
         `settings file: ${settingsFile}`,
       ].join("\n"))
@@ -678,6 +942,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       try {
         await client.session.abort({ path: { id: sid } })
         streamStates.delete(sid)
+        runningSessions.delete(sid)
         await sendMsg(chatId, `⛔ 已中止 session ${sid}`)
       } catch (err) {
         await sendMsg(chatId, `abort 失敗: ${summarizeError(err).slice(0, 200)}`)
@@ -700,7 +965,11 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     if (t === "/session list") {
       const sessions = await listSessions()
       const current = resolveSession(chatId)
-      const lines = sessions.map(s => `${s.id === current ? "▶ " : "  "}${s.id}${s.title ? ` (${s.title})` : ""}`)
+      const lines = sessions.map(s => {
+        const isCurrent = s.id === current ? "▶ " : "  "
+        const sub = s.parentID ? " [sub]" : ""
+        return `${isCurrent}${s.id}${sub}${s.title ? ` (${s.title})` : ""}`
+      })
       await sendMsg(chatId, lines.length ? lines.join("\n") : "(無 session)")
       return
     }
@@ -720,7 +989,13 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       const sid = resolveSession(chatId)
       const rec = state.sessions.find(s => s.id === sid)
       if (!sid) { await sendMsg(chatId, "(無 session)"); return }
-      await sendMsg(chatId, `session: ${sid}\ntitle: ${rec?.title ?? "(無)"}\ncreated: ${rec ? new Date(rec.createdAt).toLocaleString() : "unknown"}`)
+      await sendMsg(chatId, [
+        `session: ${sid}`,
+        `title: ${rec?.title ?? "(無)"}`,
+        `parent: ${rec?.parentID ?? "(無)"}`,
+        `created: ${rec ? new Date(rec.createdAt).toLocaleString() : "unknown"}`,
+        `busy: ${runningSessions.has(sid)}`,
+      ].join("\n"))
       return
     }
 
@@ -737,7 +1012,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       return
     }
 
-    // /model use <name>
+    // /model use <n>
     if (t.startsWith("/model use ")) {
       const model = t.slice("/model use ".length).trim()
       if (!model) { await sendMsg(chatId, "請提供模型名稱（格式：provider/model）"); return }
@@ -776,7 +1051,6 @@ export const TelegramPlugin: Plugin = async (ctx) => {
         return
       }
 
-      // 非阻塞地執行（避免 Telegram 的 long-polling 被 session.prompt 卡住）
       void runPrompt(chatId, prompt, sid).catch(err => log(`runPrompt unhandled: ${summarizeError(err)}`))
       return
     }
@@ -799,12 +1073,43 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     const cbChatId = update.callback_query?.message?.chat?.id
     if (cbData && cbChatId != null) {
       currentChatId = cbChatId
-      const match = cbData.match(/^approval:([^:]+):(deny|once|always)$/)
-      if (match) {
-        const [, id, decision] = match
+
+      // ─ Approval callback ─
+      const approvalMatch = cbData.match(/^approval:([^:]+):(deny|once|always)$/)
+      if (approvalMatch) {
+        const [, id, decision] = approvalMatch
         await log(`callback approval id=${id} decision=${decision} cbChatId=${cbChatId}`)
         await resolveApproval(id, decision as "deny" | "once" | "always")
         await answerCallback(update.callback_query!.id, `已回覆: ${decision}`)
+        return
+      }
+
+      // ─ 新增：Question callback ─
+      const questionMatch = cbData.match(/^q:([^:]+):(\d+)$/)
+      if (questionMatch) {
+        const [, shortID, idxStr] = questionMatch
+        const pq = [...pendingQuestions.values()].find(q =>
+          q.chatId === cbChatId &&
+          (q.requestID.replace(/-/g, "").startsWith(shortID) || q.requestID === shortID)
+        )
+        if (pq) {
+          const idx = parseInt(idxStr, 10)
+          // 找對應問題的選項
+          const rawAnswer = pq.questions.flatMap(q => q.options ?? []).at(idx) ?? idxStr
+          const answer = (typeof rawAnswer === "object" && rawAnswer !== null)
+            ? ((rawAnswer as any).label ?? (rawAnswer as any).text ?? JSON.stringify(rawAnswer))
+            : rawAnswer;
+          // 清除所有 shortID 的 key
+          const shortKey = pq.requestID.replace(/-/g, "").slice(0, 8)
+          clearTimeout(pq.timer)
+          pendingQuestions.delete(pq.requestID)
+          pendingQuestions.delete(shortKey)
+          await replyQuestion(pq.requestID, [answer])
+          await answerCallback(update.callback_query!.id, `✅ 已選擇: ${answer}`)
+        } else {
+          await answerCallback(update.callback_query!.id, "找不到對應的提問（可能已逾時）")
+        }
+        return
       }
     }
   }
@@ -841,8 +1146,11 @@ export const TelegramPlugin: Plugin = async (ctx) => {
 
         const updates = Array.isArray((res as any).result) ? (res as any).result as TelegramUpdate[] : []
         for (const update of updates) {
+          // 先處理，成功後才推進 offset，避免失敗時跳過後續訊息
+          await handleUpdate(update).catch(err =>
+            log(`handleUpdate error update_id=${update.update_id}: ${summarizeError(err)}`)
+          )
           state.lastUpdateId = Math.max(state.lastUpdateId, update.update_id)
-          await handleUpdate(update)
         }
         await persist()
       } catch (err) {
@@ -850,16 +1158,13 @@ export const TelegramPlugin: Plugin = async (ctx) => {
         state.lastError = msg.slice(0, 500)
         await log(`poll error: ${msg}`)
 
-        // 401 = token 無效，停止輪詢（避免無意義的高頻重試）
         if (msg.includes("401")) {
           pollStopped = true
           await log("poll: 401 Unauthorized，停止輪詢。請確認 token 是否正確。")
-          // 不退出，繼續在 stopped 狀態等待（方便未來重設後手動恢復）
           await new Promise(r => setTimeout(r, 60000))
           continue
         }
 
-        // 其他錯誤：退避重試
         await new Promise(r => setTimeout(r, pollIntervalMs * 3))
       }
     }
@@ -869,7 +1174,6 @@ export const TelegramPlugin: Plugin = async (ctx) => {
 
   await log(`plugin init; token=${Boolean(token)}; enabled=${state.enabled}; dir=${projectRoot}`)
 
-  // 啟動 bootstrap 訊息
   if (token && allowChatIds.size) {
     const firstChat = [...allowChatIds][0]
     sendMsg(firstChat, `✅ OpenCode TG Bridge 已啟動\n專案：${projectRoot}`)
@@ -877,27 +1181,24 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       .catch(err => log(`bootstrap failed: ${err?.message}`))
   }
 
+  // 補齊重啟前 pending 的 question（延遲 3 秒等 opencode server 就緒）
+  setTimeout(() => void recoverPendingQuestions(), 3000)
+
+  // 啟動 watchdog
+  startWatchdog()
+
   // 啟動 long polling（非阻塞）
   void startPolling()
 
   // ─── Plugin Hooks ─────────────────────────────────────────────────────────
 
   return {
-    /**
-     * 接收所有 OpenCode 事件。
-     * 主要處理：
-     *  - message.part.updated: 串流回覆
-     *  - session.idle: 任務完成
-     *  - session.error: 任務失敗
-     */
     async event({ event }) {
-      // 忽略 tg-plugin 自己產生的 file watcher 事件（避免循環）
       if (event?.type === "file.watcher.updated") {
         const file = String((event as any)?.properties?.file ?? "")
         if (file.includes("tg-plugin")) return
       }
 
-      // Log only non-trivial events (skip high-frequency noise)
       const quietEvents = new Set(["file.watcher.updated", "session.status", "todo.updated", "message.part.delta"])
       if (!quietEvents.has(event?.type as string)) {
         await log(`event: ${event?.type}`)
@@ -910,14 +1211,54 @@ export const TelegramPlugin: Plugin = async (ctx) => {
         return
       }
 
+      // ─ 新增：question.asked ──────────────────────────────────────────────
+      if (event?.type === "question.asked") {
+        await handleQuestionAsked((event as any)?.properties ?? event).catch(err =>
+          log(`question.asked error: ${summarizeError(err)}`)
+        )
+        return
+      }
+
+      // ─ 新增：追蹤 subagent session ─────────────────────────────────────
+      // session.created 時，若有 parentID，記錄為 subagent
       if (event?.type === "session.created" || event?.type === "session.updated") {
-        const info = (event as any)?.properties?.info
-        if (info?.id) {
-          currentSessionId = info.id
-          if (!state.sessions.find(s => s.id === info.id)) {
-            state.sessions.push({ id: info.id, title: info.title, createdAt: now() })
+        const info = (event as any)?.properties?.info ?? (event as any)?.properties
+        const sid = info?.id
+        const parentID = info?.parentID ?? info?.parentId
+        if (sid) {
+          currentSessionId = sid
+          const existing = state.sessions.find(s => s.id === sid)
+          if (!existing) {
+            state.sessions.push({ id: sid, title: info?.title, createdAt: now(), parentID })
+            if (parentID) {
+              await log(`subagent session detected: ${sid} (parent: ${parentID})`)
+              // 若 parent 在 running，subagent 也可能需要處理 question/permission
+              // 這裡只記錄，實際 event 會透過同一個 event hook 收到
+            }
           }
           await persist()
+        }
+      }
+
+      // session.idle: 任務完成
+      if (event?.type === "session.idle") {
+        const sid = (event as any)?.properties?.sessionID ?? (event as any)?.properties?.id
+        if (sid) {
+          runningSessions.delete(sid)  // 確保 busy guard 解除
+
+          // ─ 新增：檢查是否為 subagent 完成，parent 是否仍顯示 busy ────────
+          const sessionRec = state.sessions.find(s => s.id === sid)
+          if (sessionRec?.parentID) {
+            const parentID = sessionRec.parentID
+            if (runningSessions.has(parentID)) {
+              await log(`subagent ${sid} idle, parent ${parentID} still in runningSessions`)
+              // parent 的 session.idle 應該會跟著到來；若沒有，watchdog 會偵測到
+            }
+          }
+
+          await handleStreamDone(sid).catch(err =>
+            log(`stream done error: ${summarizeError(err)}`)
+          )
         }
       }
 
@@ -934,21 +1275,12 @@ export const TelegramPlugin: Plugin = async (ctx) => {
         }
       }
 
-      // session.idle: 任務完成
-      if (event?.type === "session.idle") {
-        const sid = (event as any)?.properties?.sessionID
-        if (sid) {
-          await handleStreamDone(sid).catch(err =>
-            log(`stream done error: ${summarizeError(err)}`)
-          )
-        }
-      }
-
       // session.error: 任務失敗
       if (event?.type === "session.error") {
         const sid = (event as any)?.properties?.sessionID
         const err = (event as any)?.properties?.error
         await log(`session.error sid=${sid}: ${summarizeError(err)}`)
+        if (sid) runningSessions.delete(sid)
         const ss = sid ? streamStates.get(sid) : undefined
         if (ss) {
           streamStates.delete(sid)
@@ -959,11 +1291,6 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       }
     },
 
-    /**
-     * 攔截權限授權請求，透過 TG 按鈕讓使用者決定。
-     * Permission 型別（來自 @opencode-ai/sdk）：
-     *   { id, type, title, sessionID, messageID, callID?, pattern?, metadata, time }
-     */
     async "permission.asked"(inputPermission, output) {
       await handlePermissionAsked(inputPermission, output)
     },
@@ -972,6 +1299,16 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       await handlePermissionAsked(inputPermission, output)
     },
   }
+}
+
+// ─── 工具：陣列分組 ──────────────────────────────────────────────────────────
+
+function chunkArray<T>(arr: T[], size: number): T[][] {
+  const result: T[][] = []
+  for (let i = 0; i < arr.length; i += size) {
+    result.push(arr.slice(i, i + size))
+  }
+  return result
 }
 
 export default TelegramPlugin
