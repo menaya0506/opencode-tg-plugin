@@ -34,7 +34,9 @@
 
 ## 功能清單
 
-### Telegram 指令
+### Telegram 
+- `/interrupt`：中斷當前串流
+- `/continue <prompt>`：在被中斷的對話基礎上繼續指令
 
 - `/help`：顯示指令說明
 - `/ping`：測試 bot 是否可用

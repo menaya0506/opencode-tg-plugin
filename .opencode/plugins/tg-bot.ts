@@ -128,6 +128,7 @@ type TelegramUpdate = {
 // ─── 工具函數 ──────────────────────────────────────────────────────────────
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..")
+const MAX_TG_MESSAGE_LENGTH = 3800 // Telegram 單一訊息上限約 4000，保留 200 安全邊界
 
 function now() { return Date.now() }
 
@@ -155,10 +156,16 @@ function parseToggle(v: unknown) {
 
 function summarizeError(v: unknown) {
   if (!v) return "(none)"
+  if (v instanceof Error) {
+    // 確保 Error 物件的 message、cause 都能顯示出來（避免 {} 的情況）
+    const msg = v.message || v.name || String(v)
+    const cause = (v as any).cause ? ` (cause: ${String((v as any).cause)})` : ""
+    return `${msg}${cause}`.slice(0, 2000)
+  }
   try { return JSON.stringify(v).slice(0, 2000) } catch { return String(v) }
 }
 
-function splitText(text: string, max = 3800) {
+function splitText(text: string, max = MAX_TG_MESSAGE_LENGTH) {
   if (text.length <= max) return [text]
   const chunks: string[] = []
   let start = 0
@@ -239,8 +246,18 @@ export const TelegramPlugin: Plugin = async (ctx) => {
   const pollIntervalMs = Number(process.env.TG_POLL_INTERVAL_MS ?? fileSettings.pollIntervalMs ?? 2000)
   const requestTimeoutMs = Number(process.env.TG_REQUEST_TIMEOUT_MS ?? fileSettings.requestTimeoutMs ?? 120000)
   const enabledFromConfig = parseToggle(fileSettings.enabled) ?? parseToggle(process.env.TG_PLUGIN_ENABLED) ?? true
-  // opencode server port（預設 4096）
+  // opencode server 的 base URL
+  // 優先從 ctx.client 取出（最可靠，包含動態分配的 port）
+  // fallback 到環境變數或設定檔，最後才用預設 4096
   const opencodePort = Number(process.env.OPENCODE_PORT ?? fileSettings.opencodePort ?? 4096)
+  const _clientBaseUrl: string = (() => {
+    const c = client as any
+    // SDK v2: client._client?.baseURL 或 client.baseURL 或 client._options?.baseURL
+    const raw = c?._client?.baseURL ?? c?.baseURL ?? c?._options?.baseURL ?? c?._baseURL ?? ""
+    if (raw) return raw.replace(/\/$/, "")
+    // 最後 fallback
+    return `http://127.0.0.1:${opencodePort}`
+  })()
   // 串流靜止多久（ms）後觸發 watchdog 警告（預設 5 分鐘）
   const watchdogMs = Number(process.env.TG_WATCHDOG_MS ?? fileSettings.watchdogMs ?? 5 * 60 * 1000)
 
@@ -274,6 +291,8 @@ export const TelegramPlugin: Plugin = async (ctx) => {
   // ─── 新增：Busy guard ─────────────────────────────────────────────────────
   // 記錄每個 session 目前是否正在執行中（由 plugin 自己維護，避免撞 BusyError）
   const runningSessions = new Set<string>()
+  // 新增：執行隊列，防止競態條件
+  const executionQueue = new Map<string, Promise<void>>()
 
   let currentChatId: number | undefined
   let currentSessionId: string | undefined = state.currentSessionByChat[Object.keys(state.currentSessionByChat)[0]]
@@ -284,7 +303,8 @@ export const TelegramPlugin: Plugin = async (ctx) => {
   // ─── 輔助：opencode REST ──────────────────────────────────────────────────
 
   async function ocFetch(path: string, opts?: RequestInit) {
-    return fetch(`http://localhost:${opencodePort}${path}`, {
+    // 使用從 ctx.client 萃取的正確 base URL（含動態 port）
+    return fetch(`${_clientBaseUrl}${path}`, {
       headers: { "content-type": "application/json" },
       ...opts,
     })
@@ -385,6 +405,10 @@ export const TelegramPlugin: Plugin = async (ctx) => {
         ...(chunk === chunks[chunks.length - 1] ? extra : {}),
       }).catch(err => {
         void log(`sendMsg error: ${err?.message}`)
+        // 如果錯誤是權限相關，提供更詳細的訊息
+        if (err?.message?.includes("403")) {
+          void log(`sendMsg: bot 可能沒有權限發送訊息到 chat ${chatId}`)
+        }
         return null
       })
       lastMsgId = (res as any)?.result?.message_id as number | undefined
@@ -397,7 +421,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     await tgPost(token, "editMessageText", {
       chat_id: chatId,
       message_id: messageId,
-      text: text.slice(0, 4000),
+      text: text.slice(0, MAX_TG_MESSAGE_LENGTH + 200), // Telegram 實際上限約 4000，保留安全邊界
       ...extra,
     }).catch(err => {
       const msg = err?.message ?? String(err)
@@ -422,19 +446,47 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     const ss = streamStates.get(sessionId)
     if (!ss) return
 
-    ss.buffer = text
+    // 累加文字而不是覆蓋
+    ss.buffer += text
     ss.lastActivityAt = now()
 
     const nowMs = now()
     if (nowMs - ss.lastEditAt < 1000) return
     ss.lastEditAt = nowMs
 
-    // 超過 3800 字的部分先只更新第一則（讓使用者知道還在跑）
-    // 完整超長內容在 handleStreamDone 時才切分發送
-    const displayText = text.slice(0, 3800)
-    if (ss.messageId) {
+    // 檢查是否需要開始新訊息（超過單一訊息上限）
+    if (ss.buffer.length > MAX_TG_MESSAGE_LENGTH) {
+      // 切分出已滿的部分發送
+      const chunk = ss.buffer.slice(0, MAX_TG_MESSAGE_LENGTH)
+      // 尋找合適的斷點（換行符）
+      const breakAt = chunk.lastIndexOf('\n')
+      const finalChunk = breakAt > MAX_TG_MESSAGE_LENGTH * 0.8 ? chunk.slice(0, breakAt) : chunk
+      
+      // 發送這個區塊
+      const mid = await sendMsg(ss.chatId, finalChunk)
+      if (mid) {
+        // 如果是第一條訊息，記錄 messageId
+        if (!ss.messageId) {
+          ss.messageId = mid
+        } else {
+          // 後續訊息記錄到 extraMessageIds
+          ss.extraMessageIds.push(mid)
+        }
+        // 從 buffer 移除已發送的部分
+        ss.buffer = ss.buffer.slice(finalChunk.length)
+      }
+    }
+
+    // 更新顯示當前 buffer（最多顯示 MAX_TG_MESSAGE_LENGTH 字）
+    const displayText = ss.buffer.slice(0, MAX_TG_MESSAGE_LENGTH)
+    if (ss.messageId && !ss.extraMessageIds.length) {
+      // 只有一條訊息時編輯它
       await editMsg(ss.chatId, ss.messageId, displayText)
-    } else {
+    } else if (ss.messageId && ss.extraMessageIds.length > 0) {
+      // 有多條訊息時，只編輯最後一條
+      await editMsg(ss.chatId, ss.extraMessageIds[ss.extraMessageIds.length - 1], displayText)
+    } else if (!ss.messageId) {
+      // 還沒有任何訊息，發送第一條
       const mid = await sendMsg(ss.chatId, displayText)
       if (mid) ss.messageId = mid
     }
@@ -448,22 +500,30 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     runningSessions.delete(sessionId)
 
     const finalText = ss.buffer || "(任務完成，無文字回覆)"
-    const chunks = splitText(finalText, 3800)
-
-    // 第一段 edit 進原有的進度訊息
-    if (ss.messageId) {
-      await editMsg(ss.chatId, ss.messageId, chunks[0])
-    } else {
-      await sendMsg(ss.chatId, chunks[0])
-    }
-
-    // 後續段落發新訊息
-    for (let i = 1; i < chunks.length; i++) {
-      await sendMsg(ss.chatId, chunks[i])
+    
+    // 如果還有剩餘內容，發送最後一部分
+    if (finalText.length > 0) {
+      const lastMessageId = ss.extraMessageIds.length > 0 
+        ? ss.extraMessageIds[ss.extraMessageIds.length - 1] 
+        : ss.messageId
+      
+      if (lastMessageId) {
+        // 編輯最後一條訊息
+        await editMsg(ss.chatId, lastMessageId, finalText.slice(0, MAX_TG_MESSAGE_LENGTH))
+      } else {
+        // 沒有訊息，發送新訊息
+        await sendMsg(ss.chatId, finalText.slice(0, MAX_TG_MESSAGE_LENGTH))
+      }
+      
+      // 如果剩餘內容超過 MAX_TG_MESSAGE_LENGTH 字，發送額外訊息
+      const remainingChunks = splitText(finalText.slice(MAX_TG_MESSAGE_LENGTH), MAX_TG_MESSAGE_LENGTH)
+      for (const chunk of remainingChunks) {
+        await sendMsg(ss.chatId, chunk)
+      }
     }
 
     streamStates.delete(sessionId)
-    await log(`stream done sid=${sessionId} chunks=${chunks.length}`)
+    await log(`stream done sid=${sessionId}`)
   }
 
   // ─── 新增：Watchdog ───────────────────────────────────────────────────────
@@ -493,11 +553,24 @@ export const TelegramPlugin: Plugin = async (ctx) => {
 
   async function runPrompt(chatId: number, prompt: string, sessionId: string) {
     // ─ Busy guard：避免同一 session 同時執行兩個 prompt ─
+    // 但如果 session 是被中斷的（done === true），允許繼續
     if (runningSessions.has(sessionId)) {
-      await sendMsg(chatId, [
-        `⚠️ session ${sessionId} 目前正在執行中`,
-        `請等待完成後再下指令，或用 /abort 中止`,
-      ].join("\n"))
+      const ss = streamStates.get(sessionId)
+      if (ss && ss.done) {
+        // 被中斷的 session，允許繼續
+        await log(`busy guard: session ${sessionId} 被中斷，允許繼續`)
+      } else {
+        await sendMsg(chatId, [
+          `⚠️ session ${sessionId} 目前正在執行中`,
+          `請等待完成後再下指令，或用 /abort 中止，或用 /interrupt 中斷`,
+        ].join("\n"))
+        return
+      }
+    }
+
+    // 防止競態條件：確保同一 session 不會同時執行多個 prompt
+    if (executionQueue.has(sessionId)) {
+      await log(`session ${sessionId} 已在執行隊列中，跳過重複請求`)
       return
     }
 
@@ -550,6 +623,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       } else {
         await sendMsg(chatId, `❌ 執行失敗\n${errMsg.slice(0, 500)}`)
       }
+      throw err // 重新拋出錯誤讓上層處理
     }
   }
 
@@ -658,10 +732,25 @@ export const TelegramPlugin: Plugin = async (ctx) => {
 
   async function replyQuestion(requestID: string, answers: string[]) {
     try {
-      await ocFetch(`/question/${requestID}/reply`, {
-        method: "POST",
-        body: JSON.stringify({ answers }),
-      })
+      // 優先使用 plugin client（已包含正確的 baseURL 與 auth header）
+      // client.post 支援呼叫任意 undocumented endpoint
+      const clientAny = client as any
+      if (typeof clientAny.question?.reply === "function") {
+        await clientAny.question.reply({
+          path: { id: requestID },
+          body: { answers },
+        })
+      } else {
+        // fallback：直接打 REST（注意：使用 127.0.0.1 避免 Windows IPv6 問題）
+        const res = await ocFetch(`/question/${requestID}/reply`, {
+          method: "POST",
+          body: JSON.stringify({ answers }),
+        })
+        if (!res.ok) {
+          const txt = await res.text().catch(() => "")
+          throw new Error(`HTTP ${res.status}: ${txt}`)
+        }
+      }
       await log(`question.reply sent requestID=${requestID} answers=${JSON.stringify(answers)}`)
     } catch (err) {
       await log(`question.reply error requestID=${requestID}: ${summarizeError(err)}`)
@@ -670,7 +759,16 @@ export const TelegramPlugin: Plugin = async (ctx) => {
 
   async function rejectQuestion(requestID: string) {
     try {
-      await ocFetch(`/question/${requestID}/reject`, { method: "POST" })
+      const clientAny = client as any
+      if (typeof clientAny.question?.reject === "function") {
+        await clientAny.question.reject({ path: { id: requestID } })
+      } else {
+        const res = await ocFetch(`/question/${requestID}/reject`, { method: "POST" })
+        if (!res.ok) {
+          const txt = await res.text().catch(() => "")
+          throw new Error(`HTTP ${res.status}: ${txt}`)
+        }
+      }
       await log(`question.reject sent requestID=${requestID}`)
     } catch (err) {
       await log(`question.reject error requestID=${requestID}: ${summarizeError(err)}`)
@@ -799,6 +897,8 @@ export const TelegramPlugin: Plugin = async (ctx) => {
 /run <prompt> - 執行任務（目前 session）
 /run --new <prompt> - 新 session 執行
 /abort - 中止目前任務
+/interrupt - 中斷目前串流（保留已輸出內容）
+/continue <prompt> - 在當前對話基礎上繼續
 
 /session new - 新建 session
 /session list - 列出 session
@@ -950,6 +1050,42 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       return
     }
 
+    // /interrupt
+    if (t === "/interrupt") {
+      const sid = resolveSession(chatId)
+      if (!sid) { await sendMsg(chatId, "沒有活躍的 session"); return }
+      
+      // 停止串流但保留已輸出內容
+      const ss = streamStates.get(sid)
+      if (ss) {
+        ss.done = true // 標記為完成，防止後續串流更新
+        await log(`interrupt: session ${sid} 被手動中斷`)
+        await sendMsg(chatId, `⏸️ 已中斷 session ${sid} 的串流輸出`)
+      } else {
+        await sendMsg(chatId, `session ${sid} 沒有正在串流的內容`)
+      }
+      
+      // 不移除 runningSessions，讓用戶可以用 /continue 繼續
+      return
+    }
+
+    // /continue <prompt>
+    if (t.startsWith("/continue ")) {
+      const prompt = t.slice("/continue ".length).trim()
+      if (!prompt) { await sendMsg(chatId, "請提供 prompt"); return }
+      
+      const sid = resolveSession(chatId)
+      if (!sid) { await sendMsg(chatId, "沒有活躍的 session"); return }
+      
+      try {
+        await runPrompt(chatId, prompt, sid)
+      } catch (err) {
+        await log(`continue error: ${summarizeError(err)}`)
+        await sendMsg(chatId, `❌ 繼續對話失敗: ${summarizeError(err).slice(0, 200)}`)
+      }
+      return
+    }
+
     // /session new
     if (t === "/session new") {
       try {
@@ -1051,7 +1187,13 @@ export const TelegramPlugin: Plugin = async (ctx) => {
         return
       }
 
-      void runPrompt(chatId, prompt, sid).catch(err => log(`runPrompt unhandled: ${summarizeError(err)}`))
+      // 等待 runPrompt 完成，避免競態條件
+      try {
+        await runPrompt(chatId, prompt, sid)
+      } catch (err) {
+        await log(`runPrompt error: ${summarizeError(err)}`)
+        await sendMsg(chatId, `❌ 執行過程中發生錯誤: ${summarizeError(err).slice(0, 200)}`)
+      }
       return
     }
 
@@ -1105,6 +1247,17 @@ export const TelegramPlugin: Plugin = async (ctx) => {
           pendingQuestions.delete(pq.requestID)
           pendingQuestions.delete(shortKey)
           await replyQuestion(pq.requestID, [answer])
+          // 觸發 TUI 重新渲染，讓問題選單立即消失，不需要手動點擊
+          try {
+            const clientAny = client as any
+            if (typeof clientAny.tui?.toast?.show === "function") {
+              await clientAny.tui.toast.show({ body: { message: `已選擇: ${answer}` } }).catch(() => undefined)
+            } else if (typeof clientAny.event?.send === "function") {
+              await clientAny.event.send({
+                body: { type: "tui.toast.show", properties: { message: `已選擇: ${answer}` } },
+              }).catch(() => undefined)
+            }
+          } catch { /* TUI toast 是非必要的，失敗不影響主流程 */ }
           await answerCallback(update.callback_query!.id, `✅ 已選擇: ${answer}`)
         } else {
           await answerCallback(update.callback_query!.id, "找不到對應的提問（可能已逾時）")
@@ -1173,6 +1326,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
   // ─── 初始化 ──────────────────────────────────────────────────────────────
 
   await log(`plugin init; token=${Boolean(token)}; enabled=${state.enabled}; dir=${projectRoot}`)
+  await log(`ocFetch baseURL=${_clientBaseUrl}`)
 
   if (token && allowChatIds.size) {
     const firstChat = [...allowChatIds][0]
