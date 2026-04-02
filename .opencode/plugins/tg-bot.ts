@@ -129,6 +129,9 @@ type TelegramUpdate = {
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..")
 const MAX_TG_MESSAGE_LENGTH = 3800 // Telegram 單一訊息上限約 4000，保留 200 安全邊界
+const MAX_STATE_SESSIONS = 200 // 最大保留的 session 數量
+const MAX_STATE_APPROVALS = 500 // 最大保留的 approval 數量
+const STATE_APPROVAL_TTL_MS = 7 * 24 * 60 * 60 * 1000 // approval 保留 7 天
 
 function now() { return Date.now() }
 
@@ -284,15 +287,40 @@ export const TelegramPlugin: Plugin = async (ctx) => {
   state.startedAt ??= now()
   state.lastUpdateId ??= 0
 
+function pruneState() {
+  // sessions: keep newest MAX_STATE_SESSIONS
+  if (state.sessions.length > MAX_STATE_SESSIONS) {
+    state.sessions = state.sessions
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, MAX_STATE_SESSIONS)
+  }
+  // approvals: remove old based on TTL then limit
+  const cutoff = now() - STATE_APPROVAL_TTL_MS
+  for (const [key, val] of Object.entries(state.approvals)) {
+    if (val.resolvedAt && val.resolvedAt < cutoff) delete state.approvals[key]
+  }
+  const keys = Object.keys(state.approvals)
+  if (keys.length > MAX_STATE_APPROVALS) {
+    keys
+      .sort((a, b) => (state.approvals[a].resolvedAt ?? 0) - (state.approvals[b].resolvedAt ?? 0))
+      .slice(0, keys.length - MAX_STATE_APPROVALS)
+      .forEach(k => delete state.approvals[k])
+  }
+}
+
   const pendingApprovals = new Map<string, PendingApproval>()
   const pendingQuestions = new Map<string, PendingQuestion>()  // ← 新增
   const streamStates = new Map<string, StreamState>()
+pruneState();
 
   // ─── 新增：Busy guard ─────────────────────────────────────────────────────
   // 記錄每個 session 目前是否正在執行中（由 plugin 自己維護，避免撞 BusyError）
   const runningSessions = new Set<string>()
   // 新增：執行隊列，防止競態條件
   const executionQueue = new Map<string, Promise<void>>()
+// 新增：session initiator 記錄（tg 或 computer 發起）
+const sessionInitiators = new Map<string, "tg" | "computer">()
+let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
 
   let currentChatId: number | undefined
   let currentSessionId: string | undefined = state.currentSessionByChat[Object.keys(state.currentSessionByChat)[0]]
@@ -318,6 +346,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     state.currentSessionByChat[String(chatId)] = sessionId
     if (!state.sessions.find(s => s.id === sessionId)) {
       state.sessions.push({ id: sessionId, createdAt: now(), parentID })
+      pruneState();
     }
   }
 
@@ -442,55 +471,27 @@ export const TelegramPlugin: Plugin = async (ctx) => {
 
   // ─── Stream 推送邏輯 ────────────────────────────────────────────────────
 
-  async function handleStreamPart(sessionId: string, text: string) {
+async function handleStreamPart(sessionId: string, text: string) {
     const ss = streamStates.get(sessionId)
     if (!ss) return
 
-    // 累加文字而不是覆蓋
-    ss.buffer += text
+    // 覆蓋文字而不是累加，因為更新訊息會傳完整文字
+    ss.buffer = text
     ss.lastActivityAt = now()
 
     const nowMs = now()
     if (nowMs - ss.lastEditAt < 1000) return
     ss.lastEditAt = nowMs
 
-    // 檢查是否需要開始新訊息（超過單一訊息上限）
-    if (ss.buffer.length > MAX_TG_MESSAGE_LENGTH) {
-      // 切分出已滿的部分發送
-      const chunk = ss.buffer.slice(0, MAX_TG_MESSAGE_LENGTH)
-      // 尋找合適的斷點（換行符）
-      const breakAt = chunk.lastIndexOf('\n')
-      const finalChunk = breakAt > MAX_TG_MESSAGE_LENGTH * 0.8 ? chunk.slice(0, breakAt) : chunk
-      
-      // 發送這個區塊
-      const mid = await sendMsg(ss.chatId, finalChunk)
-      if (mid) {
-        // 如果是第一條訊息，記錄 messageId
-        if (!ss.messageId) {
-          ss.messageId = mid
-        } else {
-          // 後續訊息記錄到 extraMessageIds
-          ss.extraMessageIds.push(mid)
-        }
-        // 從 buffer 移除已發送的部分
-        ss.buffer = ss.buffer.slice(finalChunk.length)
-      }
-    }
-
-    // 更新顯示當前 buffer（最多顯示 MAX_TG_MESSAGE_LENGTH 字）
+    // 顯示前段文字（讓使用者看到正在執行）
     const displayText = ss.buffer.slice(0, MAX_TG_MESSAGE_LENGTH)
-    if (ss.messageId && !ss.extraMessageIds.length) {
-      // 只有一條訊息時編輯它
-      await editMsg(ss.chatId, ss.messageId, displayText)
-    } else if (ss.messageId && ss.extraMessageIds.length > 0) {
-      // 有多條訊息時，只編輯最後一條
-      await editMsg(ss.chatId, ss.extraMessageIds[ss.extraMessageIds.length - 1], displayText)
-    } else if (!ss.messageId) {
-      // 還沒有任何訊息，發送第一條
-      const mid = await sendMsg(ss.chatId, displayText)
-      if (mid) ss.messageId = mid
+    if (ss.messageId) {
+        await editMsg(ss.chatId, ss.messageId, displayText)
+    } else {
+        const mid = await sendMsg(ss.chatId, displayText)
+        if (mid) ss.messageId = mid
     }
-  }
+}
 
   async function handleStreamDone(sessionId: string) {
     const ss = streamStates.get(sessionId)
@@ -498,58 +499,59 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     ss.done = true
 
     runningSessions.delete(sessionId)
+    // 清理 session initiator 記錄
+    sessionInitiators.delete(sessionId)
 
     const finalText = ss.buffer || "(任務完成，無文字回覆)"
-    
-    // 如果還有剩餘內容，發送最後一部分
-    if (finalText.length > 0) {
-      const lastMessageId = ss.extraMessageIds.length > 0 
-        ? ss.extraMessageIds[ss.extraMessageIds.length - 1] 
-        : ss.messageId
-      
-      if (lastMessageId) {
-        // 編輯最後一條訊息
-        await editMsg(ss.chatId, lastMessageId, finalText.slice(0, MAX_TG_MESSAGE_LENGTH))
-      } else {
-        // 沒有訊息，發送新訊息
-        await sendMsg(ss.chatId, finalText.slice(0, MAX_TG_MESSAGE_LENGTH))
-      }
-      
-      // 如果剩餘內容超過 MAX_TG_MESSAGE_LENGTH 字，發送額外訊息
-      const remainingChunks = splitText(finalText.slice(MAX_TG_MESSAGE_LENGTH), MAX_TG_MESSAGE_LENGTH)
-      for (const chunk of remainingChunks) {
-        await sendMsg(ss.chatId, chunk)
-      }
+    const chunks = splitText(finalText)
+
+    // 第一段：編輯原有的進度訊息或發送新訊息
+    if (ss.messageId) {
+        await editMsg(ss.chatId, ss.messageId, chunks[0])
+    } else {
+        await sendMsg(ss.chatId, chunks[0])
+    }
+
+    // 後續段落：逐一發新訊息
+    for (let i = 1; i < chunks.length; i++) {
+        await sendMsg(ss.chatId, chunks[i])
     }
 
     streamStates.delete(sessionId)
-    await log(`stream done sid=${sessionId}`)
+    await log(`stream done sid=${sessionId} totalLen=${finalText.length} chunks=${chunks.length}`)
   }
 
   // ─── 新增：Watchdog ───────────────────────────────────────────────────────
   // 定期檢查所有 streaming session 是否靜止過久
 
-  function startWatchdog() {
-    setInterval(async () => {
-      const staleThreshold = now() - watchdogMs
-      for (const [sid, ss] of streamStates) {
-        if (ss.done) continue
-        if (ss.lastActivityAt < staleThreshold) {
-          await log(`watchdog: sid=${sid} stale for ${watchdogMs}ms, notifying`)
-          await sendMsg(ss.chatId, [
-            `⚠️ 警告：session 已靜止超過 ${Math.round(watchdogMs / 60000)} 分鐘`,
-            `session: ${sid}`,
-            `可能原因：LLM 無回應、subagent 卡住、或等待未收到的互動`,
-            `輸入 /abort 強制中止，或繼續等待`,
-          ].join("\n"))
-          // 更新時間避免連續發警告（再等一個 watchdogMs）
-          ss.lastActivityAt = now()
+function startWatchdog() {
+    watchdogIntervalId = setInterval(async () => {
+        const staleThreshold = now() - watchdogMs
+        for (const [sid, ss] of streamStates) {
+            if (ss.done) continue
+            if (ss.lastActivityAt < staleThreshold) {
+                await log(`watchdog: sid=${sid} stale for ${watchdogMs}ms, notifying`)
+                await sendMsg(ss.chatId, [
+                    `⚠️ 警告：session 已靜止超過 ${Math.round(watchdogMs / 60000)} 分鐘`,
+                    `session: ${sid}`,
+                    `可能原因：LLM 無回應、subagent 卡住、或等待未收到的互動`,
+                    `輸入 /abort 強制中止，或繼續等待`,
+                ].join("\n"))
+                // 更新時間避免連續發警告（再等一個 watchdogMs）
+                ss.lastActivityAt = now()
+            }
         }
-      }
     }, Math.min(watchdogMs, 60_000))  // 最多每分鐘檢查一次
-  }
+}
 
-  // ─── 執行 Prompt ────────────────────────────────────────────────────────
+function stopWatchdog() {
+    if (watchdogIntervalId !== undefined) {
+        clearInterval(watchdogIntervalId)
+        watchdogIntervalId = undefined
+    }
+}
+
+// ─── 執行 Prompt ────────────────────────────────────────────────────────
 
   async function runPrompt(chatId: number, prompt: string, sessionId: string) {
     // ─ Busy guard：避免同一 session 同時執行兩個 prompt ─
@@ -635,6 +637,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     clearTimeout(item.timer)
     pendingApprovals.delete(id)
     state.approvals[id] = { id, decision, createdAt: item.createdAt, resolvedAt: now() }
+    pruneState();
     await persist()
 
     if (item.sessionID && item.permissionID) {
@@ -666,6 +669,13 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     const callID = props?.tool?.callID ?? props?.callID
     const patterns = Array.isArray(props?.patterns) ? props.patterns : []
     const pattern = patterns.join(", ")
+
+    // 檢查 session 是否由 TG 發起，如果不是則不轉發到 Telegram
+    if (sessionID && sessionInitiators.get(sessionID) !== "tg") {
+      await log(`permission.asked: session ${sessionID} not initiated by TG, ignoring`)
+      if (output) output.status = "deny"
+      return
+    }
 
     const ruleKey = JSON.stringify({ permType, pattern, sessionID })
     const cached = state.permissionRules[ruleKey]
@@ -787,6 +797,12 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       options: Array.isArray(q?.options) ? q.options : undefined,
     }))
 
+    // 檢查 session 是否由 TG 發起，如果不是則不轉發到 Telegram
+    if (sessionID && sessionInitiators.get(sessionID) !== "tg") {
+      await log(`question.asked: session ${sessionID} not initiated by TG, ignoring`)
+      return
+    }
+
     if (!requestID) {
       await log(`question.asked: missing requestID, props=${summarizeError(props)}`)
       return
@@ -808,6 +824,8 @@ export const TelegramPlugin: Plugin = async (ctx) => {
 
     await log(`question.asked: sending to chatId=${chatId} requestID=${requestID}`)
 
+    // 短 ID 先產生，供 timer 與後續使用
+    const shortID = requestID.replace(/-/g, "").slice(0, 8)
     const timer = setTimeout(async () => {
       const shortKey = requestID.replace(/-/g, "").slice(0, 8)
       pendingQuestions.delete(requestID)
@@ -820,7 +838,6 @@ export const TelegramPlugin: Plugin = async (ctx) => {
 
     // 用於 callback 的短 ID（取前 8 碼，確保 callback_data 在 64 bytes 內）
     // 格式：q:<8碼>:<選項索引> 最長 = 2+1+8+1+2 = 14 bytes，遠低於 64 限制
-    const shortID = requestID.replace(/-/g, "").slice(0, 8)
 
     // 發送每個問題
     let globalIdx = 0;
@@ -1043,6 +1060,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
         await client.session.abort({ path: { id: sid } })
         streamStates.delete(sid)
         runningSessions.delete(sid)
+        sessionInitiators.delete(sid) // 清理 session initiator 記錄
         await sendMsg(chatId, `⛔ 已中止 session ${sid}`)
       } catch (err) {
         await sendMsg(chatId, `abort 失敗: ${summarizeError(err).slice(0, 200)}`)
@@ -1076,6 +1094,11 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       
       const sid = resolveSession(chatId)
       if (!sid) { await sendMsg(chatId, "沒有活躍的 session"); return }
+      
+      // 標記這個 session 是由 TG 發起的（如果尚未標記）
+      if (!sessionInitiators.has(sid)) {
+        sessionInitiators.set(sid, "tg")
+      }
       
       try {
         await runPrompt(chatId, prompt, sid)
@@ -1187,6 +1210,9 @@ export const TelegramPlugin: Plugin = async (ctx) => {
         return
       }
 
+      // 記錄這個 session 是由 TG 發起的
+      sessionInitiators.set(sid, "tg")
+      
       // 等待 runPrompt 完成，避免競態條件
       try {
         await runPrompt(chatId, prompt, sid)
@@ -1382,13 +1408,19 @@ export const TelegramPlugin: Plugin = async (ctx) => {
         if (sid) {
           currentSessionId = sid
           const existing = state.sessions.find(s => s.id === sid)
-          if (!existing) {
+if (!existing) {
             state.sessions.push({ id: sid, title: info?.title, createdAt: now(), parentID })
+            pruneState();
             if (parentID) {
-              await log(`subagent session detected: ${sid} (parent: ${parentID})`)
-              // 若 parent 在 running，subagent 也可能需要處理 question/permission
-              // 這裡只記錄，實際 event 會透過同一個 event hook 收到
+                await log(`subagent session detected: ${sid} (parent: ${parentID})`)
+                // 若 parent 在 running，subagent 也可能需要處理 question/permission
+                // 這裡只記錄，實際 event 會透過同一個 event hook 收到
             }
+        }
+          // 如果 session 不是由 TG 發起的，記錄為 computer 發起
+          if (!sessionInitiators.has(sid)) {
+            sessionInitiators.set(sid, "computer")
+            await log(`session ${sid} marked as initiated by computer`)
           }
           await persist()
         }

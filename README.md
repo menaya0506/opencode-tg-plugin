@@ -57,6 +57,13 @@
 - `/model use <provider/model>`：切換模型
 - `/approve <id> once|always|deny`：回覆授權請求
 
+### 最新改進
+
+- 限制狀態檔 `state.json` 大小：保留最近 200 個 session、最近 500 個 approval，approval 會在 7 天後自動清除。
+- 串流文字現在 **覆蓋** 而非累加，防止記憶體爆炸。
+- 新增 watchdog 句柄在插件重新載入時會正確清除，避免多重計時器。
+- 只會將 `permission` 與 `question` 事件轉發給 Telegram，若非 Telegram 發起的 session（如由電腦端觸發），則自動忽略。
+
 ### 授權流程
 
 - 監聽 OpenCode 的 `permission.ask` / `permission.updated`
@@ -178,5 +185,5 @@
 - 不要公開 Telegram bot token
 - `allowChatIds` 建議只填自己的 chat id 或群組 id
 
-如果您喜歡我的項目歡迎打賞:
-ETH:0xAe42D0d8a25530fCb99B906f42a0eE6DF1830EA9。
+- 如果您喜歡我的項目歡迎打賞:
+- ETH: 0xAe42D0d8a25530fCb99B906f42a0eE6DF1830EA9
