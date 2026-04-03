@@ -360,8 +360,8 @@ export const TelegramPlugin: Plugin = async (ctx) => {
   const streamModeFromConfig = (process.env.TG_STREAM_MODE ?? fileSettings.streamMode ?? "cover").toString().toLowerCase() === "full" ? "full" : "cover"
   // opencode server 的 base URL
   // 優先從 ctx.client 取出（最可靠，包含動態分配的 port）
-  // fallback 到環境變數或設定檔，最後才用預設 4096
-  const opencodePort = Number(process.env.OPENCODE_PORT ?? fileSettings.opencodePort ?? 4096)
+  // fallback 到環境變數或設定檔，最後才用預設 13599
+  const opencodePort = Number(process.env.OPENCODE_PORT ?? fileSettings.opencodePort ?? 13599)
   const _clientBaseUrl: string = (() => {
     const c = client as any
     // SDK v2: client._client?.baseURL 或 client.baseURL 或 client._options?.baseURL
