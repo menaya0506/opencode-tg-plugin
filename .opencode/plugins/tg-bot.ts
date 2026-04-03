@@ -84,6 +84,27 @@ type SessionRecord = {
   parentID?: string   // 記錄 subagent 的 parent session
 }
 
+type SessionTokenSummary = {
+  messages: number
+  userMessages: number
+  assistantMessages: number
+  promptTokens: number
+  completionTokens: number
+  reasoningTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  totalTokens: number
+  latestPromptTokens?: number
+  latestCompletionTokens?: number
+  latestReasoningTokens?: number
+  latestCacheReadTokens?: number
+  latestCacheWriteTokens?: number
+  latestTotalTokens?: number
+  estimatedContextLimit?: number
+  estimatedContextUsage?: number
+  estimatedRemainingTokens?: number
+}
+
 type StreamState = {
   chatId: number
   sessionId: string
@@ -101,6 +122,7 @@ type PluginState = {
   approvals: Record<string, { id: string; decision: string; createdAt: number; resolvedAt: number }>
   permissionRules: Record<string, "deny" | "always">
   activeModelByChat: Record<string, string>
+  sessionUsageById: Record<string, SessionTokenSummary>
   enabled: boolean
   startedAt: number
   lastUpdateId: number
@@ -184,6 +206,76 @@ function splitText(text: string, max = MAX_TG_MESSAGE_LENGTH) {
   return chunks
 }
 
+function formatNumber(v?: number) {
+  return Number.isFinite(v) ? Intl.NumberFormat("en-US").format(v!) : "(unknown)"
+}
+
+function pct(value?: number) {
+  return Number.isFinite(value) ? `${value!.toFixed(1)}%` : "(unknown)"
+}
+
+function splitModelName(modelName?: string) {
+  const name = (modelName ?? "").trim()
+  const slash = name.indexOf("/")
+  if (!name || slash <= 0 || slash >= name.length - 1) return undefined
+  return {
+    providerID: name.slice(0, slash),
+    modelID: name.slice(slash + 1),
+  }
+}
+
+function hasTokenValues(tokens?: { input?: number; output?: number; reasoning?: number; total?: number; cache?: { read?: number; write?: number } }) {
+  if (!tokens) return false
+  return Boolean(
+    Number(tokens.input ?? 0) ||
+    Number(tokens.output ?? 0) ||
+    Number(tokens.reasoning ?? 0) ||
+    Number(tokens.total ?? 0) ||
+    Number(tokens.cache?.read ?? 0) ||
+    Number(tokens.cache?.write ?? 0)
+  )
+}
+
+function estimateTokensFromText(text: string) {
+  const clean = text.trim()
+  if (!clean) return 0
+  return Math.max(1, Math.ceil(clean.length / 4))
+}
+
+function estimateTokensFromMessage(item: any) {
+  const info = item?.info ?? item
+  const parts = Array.isArray(item?.parts) ? item.parts : []
+  const text = parts
+    .filter((part: any) => part?.type === "text" && typeof part?.text === "string")
+    .map((part: any) => part.text)
+    .join("\n")
+    .trim() || String(info?.summary?.body ?? "").trim()
+  const estimated = estimateTokensFromText(text)
+  if (!estimated) return undefined
+  if (info?.role === "assistant") {
+    return { input: 0, output: estimated, reasoning: 0, total: estimated, cache: { read: 0, write: 0 } }
+  }
+  return { input: estimated, output: 0, reasoning: 0, total: estimated, cache: { read: 0, write: 0 } }
+}
+
+function accumulateTokens(summary: SessionTokenSummary, tokens: { input?: number; output?: number; reasoning?: number; total?: number; cache?: { read?: number; write?: number } }) {
+  summary.promptTokens += Number(tokens.input ?? 0)
+  summary.completionTokens += Number(tokens.output ?? 0)
+  summary.reasoningTokens += Number(tokens.reasoning ?? 0)
+  summary.cacheReadTokens += Number(tokens.cache?.read ?? 0)
+  summary.cacheWriteTokens += Number(tokens.cache?.write ?? 0)
+  summary.totalTokens += Number(tokens.total ?? (Number(tokens.input ?? 0) + Number(tokens.output ?? 0)))
+}
+
+function setLatestTokens(summary: SessionTokenSummary, tokens: { input?: number; output?: number; reasoning?: number; total?: number; cache?: { read?: number; write?: number } }) {
+  summary.latestPromptTokens = Number(tokens.input ?? 0)
+  summary.latestCompletionTokens = Number(tokens.output ?? 0)
+  summary.latestReasoningTokens = Number(tokens.reasoning ?? 0)
+  summary.latestCacheReadTokens = Number(tokens.cache?.read ?? 0)
+  summary.latestCacheWriteTokens = Number(tokens.cache?.write ?? 0)
+  summary.latestTotalTokens = Number(tokens.total ?? (Number(tokens.input ?? 0) + Number(tokens.output ?? 0)))
+}
+
 async function ensureDir(dir: string) {
   await fs.mkdir(dir, { recursive: true })
 }
@@ -261,8 +353,8 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     // 最後 fallback
     return `http://127.0.0.1:${opencodePort}`
   })()
-  // 串流靜止多久（ms）後觸發 watchdog 警告（預設 5 分鐘）
-  const watchdogMs = Number(process.env.TG_WATCHDOG_MS ?? fileSettings.watchdogMs ?? 5 * 60 * 1000)
+  // 串流靜止多久（ms）後觸發 watchdog 警告（預設 15 分鐘）
+  const watchdogMs = Number(process.env.TG_WATCHDOG_MS ?? fileSettings.watchdogMs ?? 15 * 60 * 1000)
 
   // ─── 執行期狀態 ─────────────────────────────────────────────────────────
 
@@ -272,6 +364,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     approvals: {},
     permissionRules: {},
     activeModelByChat: {},
+    sessionUsageById: {},
     enabled: enabledFromConfig,
     startedAt: now(),
     lastUpdateId: 0,
@@ -282,6 +375,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
   state.approvals ??= {}
   state.permissionRules ??= {}
   state.activeModelByChat ??= {}
+  state.sessionUsageById ??= {}
   state.currentSessionByChat ??= {}
   state.enabled ??= enabledFromConfig
   state.startedAt ??= now()
@@ -382,6 +476,203 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
     return state.sessions
   }
 
+  async function getSessionTokenSummary(sessionId: string): Promise<SessionTokenSummary> {
+    const runtime = state.sessionUsageById[sessionId]
+    const summary: SessionTokenSummary = {
+      messages: 0,
+      userMessages: 0,
+      assistantMessages: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      reasoningTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      totalTokens: 0,
+    }
+
+    try {
+      const res = await (client as any).session.messages({ sessionID: sessionId, limit: 1000 })
+      const data = (res as any)?.data ?? res
+      const msgs = Array.isArray(data) ? data : []
+      summary.messages = Math.max(summary.messages, msgs.length)
+      syncUsageFromMessages(summary, msgs as any)
+    } catch (err) {
+      await log(`getSessionTokenSummary error sid=${sessionId}: ${summarizeError(err)}`)
+    }
+
+    if (summary.totalTokens === 0 && runtime) {
+      summary.messages = runtime.messages || summary.messages
+      summary.userMessages = runtime.userMessages || summary.userMessages
+      summary.assistantMessages = runtime.assistantMessages || summary.assistantMessages
+      summary.promptTokens = runtime.promptTokens || summary.promptTokens
+      summary.completionTokens = runtime.completionTokens || summary.completionTokens
+      summary.reasoningTokens = runtime.reasoningTokens || summary.reasoningTokens
+      summary.cacheReadTokens = runtime.cacheReadTokens || summary.cacheReadTokens
+      summary.cacheWriteTokens = runtime.cacheWriteTokens || summary.cacheWriteTokens
+      summary.totalTokens = runtime.totalTokens || summary.totalTokens
+      summary.latestPromptTokens = runtime.latestPromptTokens ?? summary.latestPromptTokens
+      summary.latestCompletionTokens = runtime.latestCompletionTokens ?? summary.latestCompletionTokens
+      summary.latestReasoningTokens = runtime.latestReasoningTokens ?? summary.latestReasoningTokens
+      summary.latestCacheReadTokens = runtime.latestCacheReadTokens ?? summary.latestCacheReadTokens
+      summary.latestCacheWriteTokens = runtime.latestCacheWriteTokens ?? summary.latestCacheWriteTokens
+      summary.latestTotalTokens = runtime.latestTotalTokens ?? summary.latestTotalTokens
+    }
+
+    return summary
+  }
+
+  async function getSessionInfo(sessionId: string) {
+    try {
+      const res = await client.session.get({ sessionID: sessionId })
+      const info = ((res as any)?.data ?? res) as any
+      if (info?.time?.updated) return info
+
+      const listRes = await client.session.list()
+      const listData = (listRes as any)?.data ?? listRes
+      const fromList = Array.isArray(listData) ? listData.find((s: any) => s?.id === sessionId) : undefined
+      if (fromList) {
+        return {
+          ...fromList,
+          ...info,
+          time: {
+            ...(fromList.time ?? {}),
+            ...(info?.time ?? {}),
+          },
+        }
+      }
+
+      return info
+    } catch (err) {
+      await log(`getSessionInfo error sid=${sessionId}: ${summarizeError(err)}`)
+      return undefined
+    }
+  }
+
+  function getSessionUsage(sessionId: string) {
+    state.sessionUsageById[sessionId] ??= {
+      messages: 0,
+      userMessages: 0,
+      assistantMessages: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      reasoningTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      totalTokens: 0,
+    }
+    return state.sessionUsageById[sessionId]
+  }
+
+  function syncUsageFromMessages(messages: Array<{ info: any; parts: any[] }>) {
+    const usage: SessionTokenSummary = {
+      messages: 0,
+      userMessages: 0,
+      assistantMessages: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      reasoningTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      totalTokens: 0,
+    }
+
+    for (const item of messages) {
+      const info = item?.info ?? item
+      const parts = Array.isArray(item?.parts) ? item.parts : []
+      usage.messages += 1
+      if (info?.role === "user") usage.userMessages += 1
+      if (info?.role === "assistant") usage.assistantMessages += 1
+      const stepFinish = [...parts].reverse().find((part: any) => part?.type === "step-finish" && part?.tokens)
+      const tokens = hasTokenValues(info?.tokens) ? info.tokens : stepFinish?.tokens ?? estimateTokensFromMessage(item)
+      if (!tokens) continue
+      usage.promptTokens += Number(tokens.input ?? 0)
+      usage.completionTokens += Number(tokens.output ?? 0)
+      usage.reasoningTokens += Number(tokens.reasoning ?? 0)
+      usage.cacheReadTokens += Number(tokens.cache?.read ?? 0)
+      usage.cacheWriteTokens += Number(tokens.cache?.write ?? 0)
+      usage.totalTokens += Number(tokens.total ?? (Number(tokens.input ?? 0) + Number(tokens.output ?? 0)))
+      if (info?.role === "assistant") setLatestTokens(usage, tokens)
+    }
+
+    return usage
+  }
+
+  function addUsageFromTokens(sessionId: string, role: string | undefined, tokens: { input?: number; output?: number; reasoning?: number; total?: number; cache?: { read?: number; write?: number } }) {
+    const usage = getSessionUsage(sessionId)
+    usage.messages += 1
+    if (role === "user") usage.userMessages += 1
+    if (role === "assistant") usage.assistantMessages += 1
+    usage.promptTokens += Number(tokens.input ?? 0)
+    usage.completionTokens += Number(tokens.output ?? 0)
+    usage.reasoningTokens += Number(tokens.reasoning ?? 0)
+    usage.cacheReadTokens += Number(tokens.cache?.read ?? 0)
+    usage.cacheWriteTokens += Number(tokens.cache?.write ?? 0)
+    usage.totalTokens += Number(tokens.total ?? (Number(tokens.input ?? 0) + Number(tokens.output ?? 0)))
+  }
+
+  async function getSessionChildrenCount(sessionId: string) {
+    try {
+      const res = await client.session.children({ sessionID: sessionId })
+      const data = (res as any)?.data ?? res
+      return Array.isArray(data) ? data.length : 0
+    } catch {
+      return 0
+    }
+  }
+
+  async function getSessionStatus(sessionId: string) {
+    try {
+      const res = await client.session.status()
+      const data = (res as any)?.data ?? res
+      return data?.[sessionId]
+    } catch {
+      return undefined
+    }
+  }
+
+  function formatSessionStatus(status: any) {
+    if (!status) return undefined
+    if (status.type === "retry") return `retry #${status.attempt} (next ${new Date(status.next).toLocaleString()})`
+    return status.type ?? undefined
+  }
+
+  async function getModelContextLimit(modelName?: string) {
+    const model = splitModelName(modelName)
+    if (!model) return undefined
+
+    try {
+      const res = await (client as any).provider.list()
+      const data = (res as any)?.data ?? res
+      const providers = Array.isArray(data) ? data : Array.isArray(data?.all) ? data.all : []
+      const foundProvider = providers.find((p: any) => (p?.id ?? p?.providerID) === model.providerID)
+      const limit = foundProvider?.models?.[model.modelID]?.limit?.context
+      if (Number(limit) > 0) return Number(limit)
+    } catch (err) {
+      await log(`getModelContextLimit provider.list error model=${modelName ?? "(none)"}: ${summarizeError(err)}`)
+    }
+
+    try {
+      const res = await (client as any).model.list()
+      const data = (res as any)?.data ?? res
+      const models = Array.isArray(data) ? data : Array.isArray(data?.all) ? data.all.flatMap((p: any) => Object.values(p?.models ?? {})) : []
+      const found = models.find((m: any) => (m?.providerID ?? m?.provider?.id) === model.providerID && (m?.id ?? m?.modelID) === model.modelID)
+      const limit = found?.limit?.context
+      if (Number(limit) > 0) return Number(limit)
+    } catch (err) {
+      await log(`getModelContextLimit model.list error model=${modelName ?? "(none)"}: ${summarizeError(err)}`)
+    }
+
+    try {
+      const res = await client.config.get()
+      const cfg = (res as any)?.data ?? res
+      const limit = cfg?.provider?.[model.providerID]?.models?.[model.modelID]?.limit?.context
+      return Number(limit) || undefined
+    } catch (err) {
+      await log(`getModelContextLimit config.get error model=${modelName ?? "(none)"}: ${summarizeError(err)}`)
+      return undefined
+    }
+  }
+
   // ─── 修改：listModels 支援動態 OAuth provider ────────────────────────────
 
   async function listModels(): Promise<string[]> {
@@ -389,11 +680,16 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
     try {
       const res = await (client as any).model.list()
       const data = (res as any)?.data ?? res
-      if (Array.isArray(data) && data.length > 0) {
-        return data
+      const models = Array.isArray(data)
+        ? data
+        : Array.isArray(data?.all)
+          ? data.all.flatMap((p: any) => Object.values(p?.models ?? {}).map((m: any) => ({ provider: p?.id ?? p?.providerID ?? "", model: m?.id ?? m?.modelID ?? "" })))
+          : []
+      if (models.length > 0) {
+        return models
           .map((m: any) => {
-            const provider = m?.provider?.id ?? m?.providerID ?? ""
-            const model = m?.id ?? m?.modelID ?? ""
+            const provider = m?.provider?.id ?? m?.providerID ?? m?.provider ?? m?.provider ?? ""
+            const model = m?.id ?? m?.modelID ?? m?.model ?? ""
             return provider && model ? `${provider}/${model}` : null
           })
           .filter(Boolean)
@@ -443,6 +739,34 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
       lastMsgId = (res as any)?.result?.message_id as number | undefined
     }
     return lastMsgId
+  }
+
+  async function registerTelegramCommands() {
+    if (!token) return
+    const commands = [
+      { command: "help", description: "顯示指令說明" },
+      { command: "status", description: "查看目前 session 與任務狀態" },
+      { command: "health", description: "檢查 bridge 與輪詢狀態" },
+      { command: "settings", description: "顯示插件設定" },
+      { command: "ping", description: "測試 bot 是否可用" },
+      { command: "enable", description: "啟用 TG bridge" },
+      { command: "disable", description: "停用 TG bridge" },
+      { command: "run", description: "在目前 session 執行任務" },
+      { command: "abort", description: "中止目前 session" },
+      { command: "session", description: "管理 session（new/list/switch/info）" },
+      { command: "model", description: "管理模型（list/show/use）" },
+      { command: "approve", description: "回覆授權請求" },
+      { command: "answer", description: "回覆 AI 提問" },
+      { command: "interrupt", description: "中斷串流但保留內容" },
+      { command: "continue", description: "在目前對話基礎上繼續" },
+    ]
+
+    try {
+      await tgPost(token, "setMyCommands", { commands })
+      await log(`telegram commands registered: ${commands.length}`)
+    } catch (err) {
+      await log(`registerTelegramCommands error: ${summarizeError(err)}`)
+    }
   }
 
   async function editMsg(chatId: number, messageId: number, text: string, extra?: Record<string, unknown>) {
@@ -1148,13 +1472,36 @@ function stopWatchdog() {
       const sid = resolveSession(chatId)
       const rec = state.sessions.find(s => s.id === sid)
       if (!sid) { await sendMsg(chatId, "(無 session)"); return }
-      await sendMsg(chatId, [
+      const info = await getSessionInfo(sid)
+      const childrenCount = await getSessionChildrenCount(sid)
+      const status = await getSessionStatus(sid)
+      const tokenSummary = await getSessionTokenSummary(sid)
+      const activeModel = state.activeModelByChat[String(chatId)] || defaultModel || undefined
+      const contextLimit = await getModelContextLimit(activeModel)
+      const estimatedUsedTokens = tokenSummary.latestTotalTokens ?? tokenSummary.latestPromptTokens ?? tokenSummary.totalTokens ?? 0
+      const hasContextLimit = Number.isFinite(contextLimit)
+      const estimatedUsage = hasContextLimit ? (estimatedUsedTokens / (contextLimit as number)) * 100 : undefined
+      const estimatedRemaining = hasContextLimit ? Math.max((contextLimit as number) - estimatedUsedTokens, 0) : undefined
+      const statusText = formatSessionStatus(status)
+
+      const lines = [
         `session: ${sid}`,
-        `title: ${rec?.title ?? "(無)"}`,
-        `parent: ${rec?.parentID ?? "(無)"}`,
-        `created: ${rec ? new Date(rec.createdAt).toLocaleString() : "unknown"}`,
+        `model: ${activeModel ?? "(none)"}`,
+        `title: ${info?.title ?? rec?.title ?? "(無)"}`,
+        `parent: ${info?.parentID ?? rec?.parentID ?? "(無)"}`,
+        `created: ${info?.time?.created ? new Date(info.time.created).toLocaleString() : rec ? new Date(rec.createdAt).toLocaleString() : "unknown"}`,
+        `updated: ${info?.time?.updated ? new Date(info.time.updated).toLocaleString() : "unknown"}`,
+        `status: ${statusText ?? (runningSessions.has(sid) ? "busy" : "idle")}`,
         `busy: ${runningSessions.has(sid)}`,
-      ].join("\n"))
+        `children: ${childrenCount}`,
+        `summary: +${info?.summary?.additions ?? 0} / -${info?.summary?.deletions ?? 0} / files ${info?.summary?.files ?? 0}`,
+        `tokens: prompt ${formatNumber(tokenSummary.promptTokens)}, completion ${formatNumber(tokenSummary.completionTokens)}, reasoning ${formatNumber(tokenSummary.reasoningTokens)}, cache(read/write) ${formatNumber(tokenSummary.cacheReadTokens)}/${formatNumber(tokenSummary.cacheWriteTokens)}, total ${formatNumber(tokenSummary.totalTokens)}`,
+        `context limit: ${formatNumber(contextLimit)}`,
+        `context usage: ${pct(estimatedUsage)}${estimatedUsedTokens ? ` (estimated ${formatNumber(estimatedUsedTokens)} tokens)` : ""}`,
+        `context remaining: ${formatNumber(estimatedRemaining)}`,
+        `note: context usage is estimated from session messages and current model limit; it is not a server-side exact value`,
+      ]
+      await sendMsg(chatId, lines.join("\n"))
       return
     }
 
@@ -1354,6 +1701,8 @@ function stopWatchdog() {
   await log(`plugin init; token=${Boolean(token)}; enabled=${state.enabled}; dir=${projectRoot}`)
   await log(`ocFetch baseURL=${_clientBaseUrl}`)
 
+  void registerTelegramCommands()
+
   if (token && allowChatIds.size) {
     const firstChat = [...allowChatIds][0]
     sendMsg(firstChat, `✅ OpenCode TG Bridge 已啟動\n專案：${projectRoot}`)
@@ -1458,6 +1807,20 @@ if (!existing) {
               log(`stream part error: ${summarizeError(err)}`)
             )
           }
+        }
+      }
+
+      if (event?.type === "message.updated") {
+        const props = (event as any)?.properties ?? {}
+        const sessionID = props?.sessionID
+        const info = props?.info
+        if (sessionID && info?.role === "assistant") {
+          const tokens = info?.tokens ?? estimateTokensFromMessage(props)
+          if (tokens) {
+            addUsageFromTokens(sessionID, info.role, tokens)
+            setLatestTokens(getSessionUsage(sessionID), tokens)
+          }
+          await persist()
         }
       }
 

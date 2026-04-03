@@ -51,7 +51,7 @@
 - `/session new`：建立新 session
 - `/session list`：列出 session
 - `/session switch <id>`：切換 session
-- `/session info`：查看目前 session 資訊
+- `/session info`：查看目前 session 詳細資訊、token 與 context 估算
 - `/model list`：列出可用模型
 - `/model show`：顯示目前模型
 - `/model use <provider/model>`：切換模型
@@ -114,6 +114,7 @@
 - `enabled`：是否預設啟用 bridge
 - `pollIntervalMs`：輪詢間隔，單位毫秒
 - `requestTimeoutMs`：授權等待超時，單位毫秒
+- `watchdogMs`：session 靜止超時，單位毫秒，預設 15 分鐘
 
 ## 環境變數
 
@@ -124,6 +125,7 @@
 - `TG_DEFAULT_MODEL`
 - `TG_POLL_INTERVAL_MS`
 - `TG_REQUEST_TIMEOUT_MS`
+- `TG_WATCHDOG_MS`
 - `TG_PLUGIN_ENABLED`
 - `TG_PLUGIN_STATE_DIR`
 
@@ -165,6 +167,27 @@
 - `lastError`
 - `currentSessionByChat`
 - `permissionRules`
+- `session.get` / `session.list` / `session.messages`：用於 `/session info` 顯示 session 詳情與 token 統計
+- `provider.list` / `model.list` / `config.get`：用於取得模型 context limit，計算 context usage 估算值
+
+### 初次啟動自動註冊 TG 命令
+
+插件啟動時會自動呼叫 Telegram `setMyCommands`，註冊常用命令與中文說明：
+
+- `/help`：顯示指令說明
+- `/status`：查看目前 session 與任務狀態
+- `/health`：檢查 bridge 與輪詢狀態
+- `/settings`：顯示插件設定
+- `/ping`：測試 bot 是否可用
+- `/enable` / `/disable`：啟用或停用 bridge
+- `/run`：在目前 session 執行任務
+- `/abort`：中止目前 session
+- `/session`：管理 session
+- `/model`：管理模型
+- `/approve`：回覆授權請求
+- `/answer`：回覆 AI 提問
+- `/interrupt`：中斷串流但保留內容
+- `/continue`：在目前對話基礎上繼續
 
 ## 疑難排解
 
