@@ -48,6 +48,7 @@ type TgSettings = {
   opencodePort?: number
   watchdogMs?: number
   showCompactionProgress?: boolean
+  streamMode?: "cover" | "full"
 }
 
 type PendingApproval = {
@@ -116,6 +117,7 @@ type StreamState = {
   lastEditAt: number
   lastActivityAt: number
   done: boolean
+  sentLength?: number
 }
 
 type PluginState = {
@@ -126,6 +128,7 @@ type PluginState = {
   activeModelByChat: Record<string, string>
   sessionUsageById: Record<string, SessionTokenSummary>
   showCompactionProgress: boolean
+  streamMode: "cover" | "full"
   enabled: boolean
   startedAt: number
   lastUpdateId: number
@@ -351,6 +354,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
   const pollIntervalMs = Number(process.env.TG_POLL_INTERVAL_MS ?? fileSettings.pollIntervalMs ?? 2000)
   const requestTimeoutMs = Number(process.env.TG_REQUEST_TIMEOUT_MS ?? fileSettings.requestTimeoutMs ?? 120000)
   const enabledFromConfig = parseToggle(fileSettings.enabled) ?? parseToggle(process.env.TG_PLUGIN_ENABLED) ?? true
+  const streamModeFromConfig = (process.env.TG_STREAM_MODE ?? fileSettings.streamMode ?? "cover").toString().toLowerCase() === "full" ? "full" : "cover"
   // opencode server 的 base URL
   // 優先從 ctx.client 取出（最可靠，包含動態分配的 port）
   // fallback 到環境變數或設定檔，最後才用預設 4096
@@ -376,6 +380,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     activeModelByChat: {},
     sessionUsageById: {},
     showCompactionProgress: false,
+    streamMode: streamModeFromConfig,
     enabled: enabledFromConfig,
     startedAt: now(),
     lastUpdateId: 0,
@@ -388,6 +393,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
   state.activeModelByChat ??= {}
   state.sessionUsageById ??= {}
   state.showCompactionProgress ??= false
+  state.streamMode ??= streamModeFromConfig
   state.currentSessionByChat ??= {}
   state.enabled ??= enabledFromConfig
   state.startedAt ??= now()
@@ -812,6 +818,7 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
       { command: "interrupt", description: "中斷串流但保留內容" },
       { command: "continue", description: "在目前對話基礎上繼續" },
       { command: "compaction", description: "設定上下文壓縮進度訊息" },
+      { command: "stream", description: "設定串流輸出模式" },
     ]
 
     try {
@@ -852,21 +859,61 @@ async function handleStreamPart(sessionId: string, text: string) {
     const ss = streamStates.get(sessionId)
     if (!ss) return
 
-    // 覆蓋文字而不是累加，因為更新訊息會傳完整文字
-    ss.buffer = text
+    const mode = state.streamMode ?? "cover"
     ss.lastActivityAt = now()
 
-    const nowMs = now()
-    if (nowMs - ss.lastEditAt < 1000) return
-    ss.lastEditAt = nowMs
+    if (mode === "cover") {
+      ss.buffer = text
 
-    // 顯示前段文字（讓使用者看到正在執行）
-    const displayText = ss.buffer.slice(0, MAX_TG_MESSAGE_LENGTH)
-    if (ss.messageId) {
+      const nowMs = now()
+      if (nowMs - ss.lastEditAt < 1000) return
+      ss.lastEditAt = nowMs
+
+      const displayText = ss.buffer.slice(0, MAX_TG_MESSAGE_LENGTH)
+      if (ss.messageId) {
         await editMsg(ss.chatId, ss.messageId, displayText)
-    } else {
+      } else {
         const mid = await sendMsg(ss.chatId, displayText)
         if (mid) ss.messageId = mid
+      }
+      return
+    }
+
+    const segmentSize = 1024
+    let pending = text.slice(ss.sentLength ?? 0)
+    if (!pending) return
+
+    while (pending.length > 0) {
+      if (!ss.messageId) {
+        const chunk = pending.slice(0, segmentSize)
+        const mid = await sendMsg(ss.chatId, chunk)
+        if (mid) {
+          ss.messageId = mid
+          ss.buffer = chunk
+        }
+        ss.sentLength = (ss.sentLength ?? 0) + chunk.length
+        pending = pending.slice(chunk.length)
+        continue
+      }
+
+      const room = segmentSize - ss.buffer.length
+      if (room > 0) {
+        const chunk = pending.slice(0, room)
+        ss.buffer += chunk
+        await editMsg(ss.chatId, ss.messageId, ss.buffer)
+        ss.sentLength = (ss.sentLength ?? 0) + chunk.length
+        pending = pending.slice(chunk.length)
+        continue
+      }
+
+      const chunk = pending.slice(0, segmentSize)
+      const mid = await sendMsg(ss.chatId, chunk)
+      if (mid) {
+        ss.messageId = mid
+        ss.buffer = chunk
+      }
+      ss.sentLength = (ss.sentLength ?? 0) + chunk.length
+      pending = pending.slice(chunk.length)
     }
 }
 
@@ -880,22 +927,33 @@ async function handleStreamPart(sessionId: string, text: string) {
     sessionInitiators.delete(sessionId)
 
     const finalText = ss.buffer || "(任務完成，無文字回覆)"
-    const chunks = splitText(finalText)
-
-    // 第一段：編輯原有的進度訊息或發送新訊息
-    if (ss.messageId) {
-        await editMsg(ss.chatId, ss.messageId, chunks[0])
+    let chunkCount = 0
+    if (state.streamMode === "full") {
+      if (ss.messageId) {
+        await editMsg(ss.chatId, ss.messageId, finalText)
+      } else {
+        await sendMsg(ss.chatId, finalText)
+      }
+      chunkCount = chunkByLength(finalText, 1024).length
     } else {
-        await sendMsg(ss.chatId, chunks[0])
-    }
+      const chunks = splitText(finalText)
+      chunkCount = chunks.length
 
-    // 後續段落：逐一發新訊息
-    for (let i = 1; i < chunks.length; i++) {
-        await sendMsg(ss.chatId, chunks[i])
+      // 第一段：編輯原有的進度訊息或發送新訊息
+      if (ss.messageId) {
+          await editMsg(ss.chatId, ss.messageId, chunks[0])
+      } else {
+          await sendMsg(ss.chatId, chunks[0])
+      }
+
+      // 後續段落：逐一發新訊息
+      for (let i = 1; i < chunks.length; i++) {
+          await sendMsg(ss.chatId, chunks[i])
+      }
     }
 
     streamStates.delete(sessionId)
-    await log(`stream done sid=${sessionId} totalLen=${finalText.length} chunks=${chunks.length}`)
+    await log(`stream done sid=${sessionId} totalLen=${finalText.length} chunks=${chunkCount}`)
   }
 
   // ─── 新增：Watchdog ───────────────────────────────────────────────────────
@@ -926,6 +984,16 @@ function stopWatchdog() {
         clearInterval(watchdogIntervalId)
         watchdogIntervalId = undefined
     }
+}
+
+function chunkByLength(text: string, maxLen: number) {
+  const chunks: string[] = []
+  let start = 0
+  while (start < text.length) {
+    chunks.push(text.slice(start, start + maxLen))
+    start += maxLen
+  }
+  return chunks.length ? chunks : [""]
 }
 
 // ─── 執行 Prompt ────────────────────────────────────────────────────────
@@ -972,6 +1040,7 @@ function stopWatchdog() {
       lastEditAt: now(),
       lastActivityAt: now(),
       done: false,
+      sentLength: 0,
     })
 
     let modelObj: any = undefined
@@ -1294,6 +1363,7 @@ function stopWatchdog() {
 /interrupt - 中斷目前串流（保留已輸出內容）
 /continue <prompt> - 在當前對話基礎上繼續
 /compaction progress on|off - 設定上下文壓縮過程是否顯示
+/stream mode cover|full - 設定串流輸出模式
 
 /session new - 新建 session
 /session list - 列出 session
@@ -1421,6 +1491,7 @@ function stopWatchdog() {
         `active model: ${state.activeModelByChat[String(chatId)] || defaultModel || "(none)"}`,
         `current session: ${resolveSession(chatId) ?? "(none)"}`,
         `compaction progress: ${state.showCompactionProgress ? "on" : "off"}`,
+        `stream mode: ${state.streamMode === "full" ? "full" : "cover"}`,
         `poll interval: ${pollIntervalMs}ms`,
         `approval timeout: ${requestTimeoutMs}ms`,
         `opencode port: ${opencodePort}`,
@@ -1575,6 +1646,21 @@ function stopWatchdog() {
       state.showCompactionProgress = mode === "on"
       await persist()
       await sendMsg(chatId, `✅ 壓縮過程顯示已設為 ${mode}`)
+      return
+    }
+
+    if (t.startsWith("/stream mode ")) {
+      const mode = t.slice("/stream mode ".length).trim().toLowerCase()
+      if (![
+        "cover",
+        "full",
+      ].includes(mode)) {
+        await sendMsg(chatId, "用法：/stream mode cover|full")
+        return
+      }
+      state.streamMode = mode as "cover" | "full"
+      await persist()
+      await sendMsg(chatId, `✅ 串流模式已設為 ${mode}`)
       return
     }
 

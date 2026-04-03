@@ -53,6 +53,7 @@
 - `/session switch <id>`：切換 session
 - `/session info`：查看目前 session 詳細資訊、token 與 context 估算
 - `/compaction progress on|off`：設定上下文壓縮過程是否顯示，預設 off
+- `/stream mode cover|full`：設定串流輸出模式，預設 cover
 - `/model list`：列出可用模型
 - `/model show`：顯示目前模型
 - `/model use <provider/model>`：切換模型
@@ -62,6 +63,7 @@
 
 - 限制狀態檔 `state.json` 大小：保留最近 200 個 session、最近 500 個 approval，approval 會在 7 天後自動清除。
 - 串流文字現在 **覆蓋** 而非累加，防止記憶體爆炸。
+- 串流模式可切換 `cover` / `full`，`full` 會分段續傳並回收已送出 buffer。
 - 新增 watchdog 句柄在插件重新載入時會正確清除，避免多重計時器。
 - 只會將 `permission` 與 `question` 事件轉發給 Telegram，若非 Telegram 發起的 session（如由電腦端觸發），則自動忽略。
 
@@ -103,7 +105,8 @@
   "defaultModel": "openai/gpt-5.4-mini",
   "enabled": true,
   "pollIntervalMs": 1500,
-  "requestTimeoutMs": 120000
+  "requestTimeoutMs": 120000,
+  "streamMode": "cover"
 }
 ```
 
@@ -116,6 +119,7 @@
 - `pollIntervalMs`：輪詢間隔，單位毫秒
 - `requestTimeoutMs`：授權等待超時，單位毫秒
 - `watchdogMs`：session 靜止超時，單位毫秒，預設 15 分鐘
+- `streamMode`：串流輸出模式，`cover` 或 `full`，預設 `cover`
 
 ## 環境變數
 
@@ -127,6 +131,7 @@
 - `TG_POLL_INTERVAL_MS`
 - `TG_REQUEST_TIMEOUT_MS`
 - `TG_WATCHDOG_MS`
+- `TG_STREAM_MODE`
 - `TG_PLUGIN_ENABLED`
 - `TG_PLUGIN_STATE_DIR`
 
@@ -171,6 +176,7 @@
 - `session.get` / `session.list` / `session.messages`：用於 `/session info` 顯示 session 詳情與 token 統計
 - `provider.list` / `model.list` / `config.get`：用於取得模型 context limit，計算 context usage 估算值
 - `session.updated` / `session.compacted`：用於在 TG 發起的 session 壓縮時發送開始與結束通知
+- `streamMode`：控制串流訊息是覆蓋單則還是分段續傳
 
 ### 初次啟動自動註冊 TG 命令
 
@@ -191,6 +197,7 @@
 - `/interrupt`：中斷串流但保留內容
 - `/continue`：在目前對話基礎上繼續
 - `/compaction progress on|off`：切換壓縮過程顯示
+- `/stream mode cover|full`：切換串流輸出模式
 
 ## 疑難排解
 
