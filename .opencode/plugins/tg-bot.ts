@@ -35,6 +35,7 @@
 
 import fs from "node:fs/promises"
 import fsSync from "node:fs"
+import { execFileSync } from "node:child_process"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import type { Plugin } from "@opencode-ai/plugin"
@@ -233,6 +234,22 @@ function splitModelName(modelName?: string) {
   }
 }
 
+function detectOpencodeBaseUrlFromProcess() {
+  try {
+    const ps = `
+$p = Get-CimInstance Win32_Process -Filter "Name = 'opencode-cli.exe'" | Select-Object -First 1 -ExpandProperty CommandLine
+if ($p -and $p -match '--port\\s+(\\d+)') { $Matches[1] }
+`
+    const out = execFileSync("powershell.exe", ["-NoLogo", "-NoProfile", "-Command", ps], { encoding: "utf8" }).trim()
+    if (!out) return undefined
+    const port = Number(out)
+    if (!Number.isFinite(port) || port <= 0) return undefined
+    return `http://127.0.0.1:${port}`
+  } catch {
+    return undefined
+  }
+}
+
 type CompactionTracker = {
   chatId: number
   startedAt: number
@@ -360,13 +377,15 @@ export const TelegramPlugin: Plugin = async (ctx) => {
   const streamModeFromConfig = (process.env.TG_STREAM_MODE ?? fileSettings.streamMode ?? "cover").toString().toLowerCase() === "full" ? "full" : "cover"
   // opencode server 的 base URL
   // 優先從 ctx.client 取出（最可靠，包含動態分配的 port）
-  // fallback 到環境變數或設定檔，最後才用預設 13599
+  // fallback 先從目前 opencode-cli 進程命令列抓 --port，再回退到設定值
   const opencodePort = Number(process.env.OPENCODE_PORT ?? fileSettings.opencodePort ?? 13599)
   const _clientBaseUrl: string = (() => {
     const c = client as any
     // SDK v2: client._client?.baseURL 或 client.baseURL 或 client._options?.baseURL
     const raw = c?._client?.baseURL ?? c?.baseURL ?? c?._options?.baseURL ?? c?._baseURL ?? ""
     if (raw) return raw.replace(/\/$/, "")
+    const detected = detectOpencodeBaseUrlFromProcess()
+    if (detected) return detected
     // 最後 fallback
     return `http://127.0.0.1:${opencodePort}`
   })()

@@ -175,6 +175,7 @@
 - `permissionRules`
 - `session.get` / `session.list` / `session.messages`：用於 `/session info` 顯示 session 詳情與 token 統計
 - `provider.list` / `model.list` / `config.get`：用於取得模型 context limit，計算 context usage 估算值
+- `ctx.client` / `opencode-cli.exe --port`：用於動態探測 OpenCode 本機 API port
 - `session.updated` / `session.compacted`：用於在 TG 發起的 session 壓縮時發送開始與結束通知
 - `streamMode`：控制串流訊息是覆蓋單則還是分段續傳
 
