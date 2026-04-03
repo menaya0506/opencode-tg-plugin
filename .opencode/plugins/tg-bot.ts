@@ -371,9 +371,10 @@ export const TelegramPlugin: Plugin = async (ctx) => {
   const fileSettings = await readJson<TgSettings>(settingsFile, {})
 
   const token = process.env.TG_BOT_TOKEN ?? fileSettings.token
+  const normalizedChatIds = normalizeChatIds(fileSettings.allowChatIds)
   const allowChatIds = toIntSet(
-    normalizeChatIds(fileSettings.allowChatIds).length
-      ? normalizeChatIds(fileSettings.allowChatIds)
+    normalizedChatIds.length
+      ? normalizedChatIds
       : parseCsv(process.env.TG_ALLOW_CHAT_IDS)
   )
   const defaultModel = (process.env.TG_DEFAULT_MODEL ?? fileSettings.defaultModel ?? "").trim()
@@ -446,6 +447,13 @@ function pruneState() {
       .slice(0, keys.length - MAX_STATE_APPROVALS)
       .forEach(k => delete state.approvals[k])
   }
+  // sessionUsageById: only keep usage for sessions that still exist in state.sessions
+  if (state.sessionUsageById) {
+    const knownSids = new Set(state.sessions.map(s => s.id))
+    for (const sid of Object.keys(state.sessionUsageById)) {
+      if (!knownSids.has(sid)) delete state.sessionUsageById[sid]
+    }
+  }
 }
 
   const pendingApprovals = new Map<string, PendingApproval>()
@@ -457,8 +465,6 @@ pruneState();
   // ─── 新增：Busy guard ─────────────────────────────────────────────────────
   // 記錄每個 session 目前是否正在執行中（由 plugin 自己維護，避免撞 BusyError）
   const runningSessions = new Set<string>()
-  // 新增：執行隊列，防止競態條件
-  const executionQueue = new Map<string, Promise<void>>()
 // 新增：session initiator 記錄（tg 或 computer 發起）
 const sessionInitiators = new Map<string, "tg" | "computer">()
 let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
@@ -470,6 +476,23 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
   const instanceId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
 
   const persist = () => writeJson(stateFile, state).catch(() => undefined)
+  // 節流版：只有在有意義的狀態變更時才寫磁碟
+  let _persistDirty = false
+  let _lastPersistAt = 0
+  function markDirty() { _persistDirty = true }
+  async function persistIfDirty() {
+    const elapsed = now() - _lastPersistAt
+    if (!_persistDirty && elapsed < 30_000) return  // 無變更且不到 30 秒，跳過
+    _persistDirty = false
+    _lastPersistAt = now()
+    await persist()
+  }
+  // persistNow: 立即寫（用於重要事件如 session 建立、approval 等）
+  async function persistNow() {
+    _persistDirty = false
+    _lastPersistAt = now()
+    await persist()
+  }
 
   // ─── 輔助：opencode REST ──────────────────────────────────────────────────
 
@@ -575,7 +598,7 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
     if (!id) throw new Error("OpenCode did not return a session id")
     rememberSession(currentChatId ?? 0, id)
     sessionInitiators.set(id, "tg")
-    await persist()
+    await persistNow()
     return id as string
   }
 
@@ -982,7 +1005,7 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
                   // process the update normally
                   await handleUpdate(u).catch(() => undefined)
                   state.lastUpdateId = Math.max(state.lastUpdateId, u.update_id)
-                  await persist()
+                  await persistNow()
                   // if pq was resolved by handleUpdate, stop timeout handler
                   if (!pendingQuestions.has(requestID) && !pendingQuestions.has(shortID)) {
                     await log(`grace poll: question ${shortID} resolved via callback, skipping reject`)
@@ -1002,7 +1025,7 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
               state.lastUpdateId = Math.max(state.lastUpdateId, u.update_id)
             }
           }
-          if (graceUpdates.length > 0) await persist()
+          if (graceUpdates.length > 0) await persistNow()
         } catch { /* grace poll failure is non-fatal */ }
       }
 
@@ -1081,7 +1104,8 @@ async function handleStreamPart(sessionId: string, text: string) {
 
   async function handleStreamDone(sessionId: string) {
     const ss = streamStates.get(sessionId)
-    if (!ss || ss.done) return
+    if (!ss) return
+    if (ss.done) { streamStates.delete(sessionId); return }  // 避免 leak：已完成但未清理的 entry
     ss.done = true
 
     runningSessions.delete(sessionId)
@@ -1138,6 +1162,30 @@ function startWatchdog() {
                 ss.lastActivityAt = now()
             }
         }
+        // ─ TTL 清理：移除長期殘留的 in-memory entries ─
+        // streamStates: 已完成（done=true）但未清理的 entry
+        for (const [sid, ss] of streamStates) {
+            if (ss.done) streamStates.delete(sid)
+        }
+        // runningSessions / compactionTrackers / sessionInitiators:
+        // 若 session 不在 streamStates 中（即已結束），且不在 state.sessions 最近列表中，清理之
+        const recentSids = new Set(state.sessions.slice(0, MAX_STATE_SESSIONS).map(s => s.id))
+        for (const sid of runningSessions) {
+            if (!streamStates.has(sid) && !recentSids.has(sid)) {
+                runningSessions.delete(sid)
+                await log(`watchdog: cleaned stale runningSessions entry sid=${sid}`)
+            }
+        }
+        for (const sid of compactionTrackers.keys()) {
+            if (!streamStates.has(sid) && !recentSids.has(sid)) {
+                compactionTrackers.delete(sid)
+            }
+        }
+        for (const sid of sessionInitiators.keys()) {
+            if (!streamStates.has(sid) && !runningSessions.has(sid) && !recentSids.has(sid)) {
+                sessionInitiators.delete(sid)
+            }
+        }
     }, Math.min(watchdogMs, 60_000))  // 最多每分鐘檢查一次
 }
 
@@ -1175,12 +1223,6 @@ function chunkByLength(text: string, maxLen: number) {
         ].join("\n"))
         return
       }
-    }
-
-    // 防止競態條件：確保同一 session 不會同時執行多個 prompt
-    if (executionQueue.has(sessionId)) {
-      await log(`session ${sessionId} 已在執行隊列中，跳過重複請求`)
-      return
     }
 
     rememberSession(chatId, sessionId)
@@ -1246,7 +1288,7 @@ function chunkByLength(text: string, maxLen: number) {
     pendingApprovals.delete(id)
     state.approvals[id] = { id, decision, createdAt: item.createdAt, resolvedAt: now() }
     pruneState();
-    await persist()
+    await persistNow()
 
     if (item.sessionID && item.permissionID) {
       const response = decision === "deny" ? "reject" : decision
@@ -1694,15 +1736,9 @@ function chunkByLength(text: string, maxLen: number) {
       const rid = rest.slice(0, spaceIdx).trim()
       const answer = rest.slice(spaceIdx + 1).trim()
 
-      // 支援 shortID 或 requestID 前綴比對
-      const pq = [...pendingQuestions.values()].find(q =>
-        q.chatId === chatId && (
-          q.requestID === rid ||
-          q.requestID.startsWith(rid) ||
-          q.requestID.replace(/-/g, "").startsWith(rid)
-        )
-      )
-      if (!pq) {
+      // 支援 shortID 或 requestID 直接查找（shortID 已存入 pendingQuestions）
+      const pq = pendingQuestions.get(rid) ?? pendingQuestions.get(rid.replace(/-/g, ""))
+      if (!pq || pq.chatId !== chatId) {
         await sendMsg(chatId, `找不到 AI 提問 \`${rid}\`，可能已逾時或已回覆`)
         return
       }
@@ -1735,14 +1771,14 @@ function chunkByLength(text: string, maxLen: number) {
 
     if (t === "/enable") {
       state.enabled = true
-      await persist()
+      await persistNow()
       await sendMsg(chatId, "TG bridge 已啟用 ✅")
       return
     }
 
     if (t === "/disable") {
       state.enabled = false
-      await persist()
+      await persistNow()
       await sendMsg(chatId, "TG bridge 已停用 ⛔")
       return
     }
@@ -1888,7 +1924,7 @@ function chunkByLength(text: string, maxLen: number) {
       const id = t.slice("/session switch ".length).trim()
       if (!id) { await sendMsg(chatId, "請提供 session id"); return }
       rememberSession(chatId, id)
-      await persist()
+      await persistNow()
       await sendMsg(chatId, `✅ 已切換到 ${id}`)
       return
     }
@@ -1943,7 +1979,7 @@ function chunkByLength(text: string, maxLen: number) {
         return
       }
       state.showCompactionProgress = mode === "on"
-      await persist()
+      await persistNow()
       await sendMsg(chatId, `✅ 壓縮過程顯示已設為 ${mode}`)
       return
     }
@@ -1958,7 +1994,7 @@ function chunkByLength(text: string, maxLen: number) {
         return
       }
       state.streamMode = mode as "cover" | "full"
-      await persist()
+      await persistNow()
       await sendMsg(chatId, `✅ 串流模式已設為 ${mode}`)
       return
     }
@@ -1982,7 +2018,7 @@ function chunkByLength(text: string, maxLen: number) {
       if (!model) { await sendMsg(chatId, "請提供模型名稱（格式：provider/model）"); return }
       if (!model.includes("/")) { await sendMsg(chatId, "格式錯誤，請使用 provider/model"); return }
       state.activeModelByChat[String(chatId)] = model
-      await persist()
+      await persistNow()
       await sendMsg(chatId, `✅ 模型已切換為 ${model}`)
       return
     }
@@ -2015,9 +2051,6 @@ function chunkByLength(text: string, maxLen: number) {
         await sendMsg(chatId, `無法建立 session: ${summarizeError(err).slice(0, 200)}`)
         return
       }
-
-      // 記錄這個 session 是由 TG 發起的
-      sessionInitiators.set(sid, "tg")
       
       // 非阻塞執行：不 await runPrompt，避免 session.prompt 阻塞 poll loop
       // （LLM 若問 question，poll loop 才能收到 callback 回覆）
@@ -2065,11 +2098,9 @@ function chunkByLength(text: string, maxLen: number) {
       const questionMatch = cbData.match(/^q:([^:]+):(\d+)$/)
       if (questionMatch) {
         const [, shortID, idxStr] = questionMatch
-        const pq = [...pendingQuestions.values()].find(q =>
-          q.chatId === cbChatId &&
-          (q.requestID.replace(/-/g, "").startsWith(shortID) || q.requestID === shortID)
-        )
-        if (pq) {
+        // 直接用 shortID 查 pendingQuestions（shortID 已在 handleQuestionAsked 中作為 key 存入）
+        const pq = pendingQuestions.get(shortID)
+        if (pq && pq.chatId === cbChatId) {
           if (pq.responding) {
             await answerCallback(update.callback_query!.id, "回覆中，請稍後")
             return
@@ -2159,7 +2190,8 @@ function chunkByLength(text: string, maxLen: number) {
           )
           state.lastUpdateId = Math.max(state.lastUpdateId, update.update_id)
         }
-        await persist()
+        if (updates.length > 0) markDirty()  // 只有收到 update 才標記
+        await persistIfDirty()
         // short polling：每次 cycle 後等 pollIntervalMs（1500ms 預設）
         await new Promise(r => setTimeout(r, pollIntervalMs))
       } catch (err) {
@@ -2210,6 +2242,8 @@ function chunkByLength(text: string, maxLen: number) {
 
   // ─── Plugin Hooks ─────────────────────────────────────────────────────────
 
+  const quietEvents = new Set(["file.watcher.updated", "session.status", "todo.updated", "message.part.delta"])
+
   return {
     async event({ event }) {
       if (event?.type === "file.watcher.updated") {
@@ -2217,7 +2251,6 @@ function chunkByLength(text: string, maxLen: number) {
         if (file.includes("tg-plugin")) return
       }
 
-      const quietEvents = new Set(["file.watcher.updated", "session.status", "todo.updated", "message.part.delta"])
       if (!quietEvents.has(event?.type as string)) {
         await log(`event: ${event?.type}`)
       }
@@ -2290,7 +2323,7 @@ if (!existing) {
           if (info?.time?.compacting && isTGInitiatedSession(sid)) {
             await notifyCompactionStart(sid).catch(err => log(`notifyCompactionStart error sid=${sid}: ${summarizeError(err)}`))
           }
-          await persist()
+          await persistNow()
         }
       }
 
@@ -2299,7 +2332,7 @@ if (!existing) {
         if (sid) {
           await notifyCompactionEnd(sid).catch(err => log(`notifyCompactionEnd error sid=${sid}: ${summarizeError(err)}`))
           compactionTrackers.delete(sid)
-          await persist()
+          await persistNow()
         }
       }
 
@@ -2316,6 +2349,7 @@ if (!existing) {
         const sid = (event as any)?.properties?.sessionID ?? (event as any)?.properties?.id
         if (sid) {
           runningSessions.delete(sid)  // 確保 busy guard 解除
+          sessionInitiators.delete(sid) // 防止 sessionInitiators 無限增長
           compactionTrackers.delete(sid)
 
           // ─ 新增：檢查是否為 subagent 完成，parent 是否仍顯示 busy ────────
@@ -2357,7 +2391,7 @@ if (!existing) {
             addUsageFromTokens(sessionID, info.role, tokens)
             setLatestTokens(getSessionUsage(sessionID), tokens)
           }
-          await persist()
+          await persistNow()
         }
       }
 
@@ -2367,6 +2401,7 @@ if (!existing) {
         const err = (event as any)?.properties?.error
         await log(`session.error sid=${sid}: ${summarizeError(err)}`)
         if (sid) runningSessions.delete(sid)
+        if (sid) sessionInitiators.delete(sid) // 防止 sessionInitiators 無限增長
         if (sid) compactionTrackers.delete(sid)
         const ss = sid ? streamStates.get(sid) : undefined
         if (ss) {
