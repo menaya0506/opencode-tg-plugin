@@ -1214,17 +1214,19 @@ function chunkByLength(text: string, maxLen: number) {
 
   // ─── 新增：Question 流程 ─────────────────────────────────────────────────
 
-  async function replyQuestion(requestID: string, answers: string[]) {
+  async function replyQuestion(requestID: string, answers: string[][]) {
     try {
       const clientAny = client as any
+      await log(`question.reply try requestID=${requestID} answers=${JSON.stringify(answers)}`)
       if (typeof clientAny.question?.reply === "function") {
         await clientAny.question.reply({
           requestID,
+          directory: projectRoot,
           body: { answers },
         })
       } else {
         // fallback：直接打 REST，補上 SDK client 的 auth headers
-        const res = await ocFetch(`/question/${requestID}/reply`, {
+        const res = await ocFetch(`/question/${encodeURIComponent(requestID)}/reply?directory=${encodeURIComponent(projectRoot)}`, {
           method: "POST",
           headers: {
             ...getAuthHeaders(),
@@ -1449,7 +1451,7 @@ function chunkByLength(text: string, maxLen: number) {
       clearTimeout(pq.timer)
       pendingQuestions.delete(pq.requestID)
       pendingQuestions.delete(shortKey)
-      await replyQuestion(pq.requestID, [answer])
+      await replyQuestion(pq.requestID, [[answer]])
       await sendMsg(chatId, `✅ 已回覆 AI 提問`)
       return
     }
@@ -1808,7 +1810,7 @@ function chunkByLength(text: string, maxLen: number) {
           clearTimeout(pq.timer)
           pendingQuestions.delete(pq.requestID)
           pendingQuestions.delete(shortKey)
-          await replyQuestion(pq.requestID, [answer])
+          await replyQuestion(pq.requestID, [[answer]])
           // 觸發 TUI 重新渲染，讓問題選單立即消失，不需要手動點擊
           try {
             const clientAny = client as any
