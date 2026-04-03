@@ -178,6 +178,7 @@
 - `ctx.client` / `opencode-cli.exe --port`：用於動態探測 OpenCode 本機 API port
 - `session.updated` / `session.compacted`：用於在 TG 發起的 session 壓縮時發送開始與結束通知
 - `streamMode`：控制串流訊息是覆蓋單則還是分段續傳
+- `question.reply` / `question.reject`：優先使用 SDK 的 question API，fallback 時會帶上 client auth headers
 
 ### 初次啟動自動註冊 TG 命令
 

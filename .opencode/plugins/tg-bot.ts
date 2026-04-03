@@ -473,6 +473,12 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
     })
   }
 
+  function getAuthHeaders() {
+    const c = client as any
+    const headers = c?._client?.headers ?? c?.headers ?? c?._options?.headers ?? {}
+    return headers && typeof headers === "object" ? headers : {}
+  }
+
   // ─── 輔助：Session ──────────────────────────────────────────────────────
 
   function rememberSession(chatId: number, sessionId: string, parentID?: string) {
@@ -1210,18 +1216,19 @@ function chunkByLength(text: string, maxLen: number) {
 
   async function replyQuestion(requestID: string, answers: string[]) {
     try {
-      // 優先使用 plugin client（已包含正確的 baseURL 與 auth header）
-      // client.post 支援呼叫任意 undocumented endpoint
       const clientAny = client as any
       if (typeof clientAny.question?.reply === "function") {
         await clientAny.question.reply({
-          path: { id: requestID },
+          requestID,
           body: { answers },
         })
       } else {
-        // fallback：直接打 REST（注意：使用 127.0.0.1 避免 Windows IPv6 問題）
+        // fallback：直接打 REST，補上 SDK client 的 auth headers
         const res = await ocFetch(`/question/${requestID}/reply`, {
           method: "POST",
+          headers: {
+            ...getAuthHeaders(),
+          },
           body: JSON.stringify({ answers }),
         })
         if (!res.ok) {
@@ -1239,9 +1246,9 @@ function chunkByLength(text: string, maxLen: number) {
     try {
       const clientAny = client as any
       if (typeof clientAny.question?.reject === "function") {
-        await clientAny.question.reject({ path: { id: requestID } })
+        await clientAny.question.reject({ requestID })
       } else {
-        const res = await ocFetch(`/question/${requestID}/reject`, { method: "POST" })
+        const res = await ocFetch(`/question/${requestID}/reject`, { method: "POST", headers: { ...getAuthHeaders() } })
         if (!res.ok) {
           const txt = await res.text().catch(() => "")
           throw new Error(`HTTP ${res.status}: ${txt}`)
