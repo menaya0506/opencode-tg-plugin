@@ -22,6 +22,9 @@
  *   /session switch <id> - 切換 session
  *   /session info      - 查看目前 session 資訊
  *
+ *   /compaction progress on|off - 設定壓縮過程顯示
+ *   /stream mode cover|full     - 切換串流輸出模式
+ *
  *   /model list        - 列出可用模型（含 OAuth provider 動態模型）
  *   /model show        - 顯示目前模型
  *   /model use <n>     - 切換模型（格式：provider/model）
