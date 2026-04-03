@@ -64,12 +64,13 @@
 - 限制狀態檔 `state.json` 大小：保留最近 200 個 session、最近 500 個 approval，approval 會在 7 天後自動清除。
 - 串流文字現在 **覆蓋** 而非累加，防止記憶體爆炸。
 - 串流模式可切換 `cover` / `full`，`full` 會分段續傳並回收已送出 buffer。
+- 輪詢改為 short polling（預設 500ms），並使用 instance lock 避免插件重新載入時重複啟動 polling loop。
 - 新增 watchdog 句柄在插件重新載入時會正確清除，避免多重計時器。
-- 只會將 `permission` 與 `question` 事件轉發給 Telegram，若非 Telegram 發起的 session（如由電腦端觸發），則自動忽略。
+- `permission` 與 `question` callback 會直接回到 Telegram，若非 Telegram 發起的 session（如由電腦端觸發），則會自動忽略。
 
 ### 授權流程
 
-- 監聽 OpenCode 的 `permission.ask` / `permission.updated`
+- 監聽 OpenCode 的 `permission.asked` / `permission.ask`
 - 在 TG 顯示「拒絕 / 允許一次 / 永遠允許」按鈕
 - `always` 與 `deny` 會寫入本機規則快取
 - 任務進度會綁定 session 顯示在同一則 TG 訊息上
@@ -104,7 +105,7 @@
   "allowChatIds": [123456789],
   "defaultModel": "openai/gpt-5.4-mini",
   "enabled": true,
-  "pollIntervalMs": 1500,
+  "pollIntervalMs": 500,
   "requestTimeoutMs": 120000,
   "streamMode": "cover"
 }
@@ -116,16 +117,16 @@
 - `allowChatIds`：允許操作的 chat id，可填多個
 - `defaultModel`：預設模型名稱，格式為 `provider/model`
 - `enabled`：是否預設啟用 bridge
-- `pollIntervalMs`：輪詢間隔，單位毫秒
+- `pollIntervalMs`：輪詢間隔，單位毫秒，預設 500
 - `requestTimeoutMs`：授權等待超時，單位毫秒
 - `watchdogMs`：session 靜止超時，單位毫秒，預設 15 分鐘
 - `streamMode`：串流輸出模式，`cover` 或 `full`，預設 `cover`
 
 ### Question 回覆
 
-- `question.reply` / `question.reject` 會優先使用 SDK，並帶上 `directory` 參數
+- `question.reply` / `question.reject` 會透過 OpenCode SDK client 發 request，不走裸 `fetch`，避免 401
 - `/answer` 與按鈕回覆會在成功後清掉 pending 狀態與 TG inline keyboard
-- 若 SDK 回覆失敗，會保留提問並重試 timeout 流程，避免卡成假成功
+- 若回覆失敗，會保留提問並走 timeout / 重試流程，避免卡成假成功
 
 ## 環境變數
 
