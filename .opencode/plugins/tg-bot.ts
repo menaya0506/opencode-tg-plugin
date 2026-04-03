@@ -47,6 +47,7 @@ type TgSettings = {
   enabled?: boolean
   opencodePort?: number
   watchdogMs?: number
+  showCompactionProgress?: boolean
 }
 
 type PendingApproval = {
@@ -82,6 +83,7 @@ type SessionRecord = {
   title?: string
   createdAt: number
   parentID?: string   // 記錄 subagent 的 parent session
+  initiatedBy?: "tg" | "computer"
 }
 
 type SessionTokenSummary = {
@@ -123,6 +125,7 @@ type PluginState = {
   permissionRules: Record<string, "deny" | "always">
   activeModelByChat: Record<string, string>
   sessionUsageById: Record<string, SessionTokenSummary>
+  showCompactionProgress: boolean
   enabled: boolean
   startedAt: number
   lastUpdateId: number
@@ -222,6 +225,13 @@ function splitModelName(modelName?: string) {
     providerID: name.slice(0, slash),
     modelID: name.slice(slash + 1),
   }
+}
+
+type CompactionTracker = {
+  chatId: number
+  startedAt: number
+  startMessageId?: number
+  progressMessageId?: number
 }
 
 function hasTokenValues(tokens?: { input?: number; output?: number; reasoning?: number; total?: number; cache?: { read?: number; write?: number } }) {
@@ -365,6 +375,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
     permissionRules: {},
     activeModelByChat: {},
     sessionUsageById: {},
+    showCompactionProgress: false,
     enabled: enabledFromConfig,
     startedAt: now(),
     lastUpdateId: 0,
@@ -376,6 +387,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
   state.permissionRules ??= {}
   state.activeModelByChat ??= {}
   state.sessionUsageById ??= {}
+  state.showCompactionProgress ??= false
   state.currentSessionByChat ??= {}
   state.enabled ??= enabledFromConfig
   state.startedAt ??= now()
@@ -405,6 +417,7 @@ function pruneState() {
   const pendingApprovals = new Map<string, PendingApproval>()
   const pendingQuestions = new Map<string, PendingQuestion>()  // ← 新增
   const streamStates = new Map<string, StreamState>()
+  const compactionTrackers = new Map<string, CompactionTracker>()
 pruneState();
 
   // ─── 新增：Busy guard ─────────────────────────────────────────────────────
@@ -442,6 +455,44 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
       state.sessions.push({ id: sessionId, createdAt: now(), parentID })
       pruneState();
     }
+    const rec = state.sessions.find(s => s.id === sessionId)
+    if (rec) rec.initiatedBy ??= sessionInitiators.get(sessionId) ?? undefined
+  }
+
+  function resolveChatForSession(sessionID: string) {
+    const entry = Object.entries(state.currentSessionByChat).find(([, sid]) => sid === sessionID)
+    return entry ? Number(entry[0]) : currentChatId
+  }
+
+  function isTGInitiatedSession(sessionID?: string) {
+    return !!sessionID && sessionInitiators.get(sessionID) === "tg"
+  }
+
+  async function notifyCompactionStart(sessionID: string) {
+    if (!isTGInitiatedSession(sessionID)) return
+    const chatId = resolveChatForSession(sessionID)
+    if (chatId == null || Number.isNaN(chatId)) return
+    if (compactionTrackers.has(sessionID)) return
+    const mid = await sendMsg(chatId, `🗜️ 開始上下文壓縮\nsession: ${sessionID}`)
+    const tracker: CompactionTracker = { chatId, startedAt: now(), startMessageId: mid }
+    if (state.showCompactionProgress) {
+      tracker.progressMessageId = await sendMsg(chatId, `↻ 壓縮進行中...\nsession: ${sessionID}`)
+    }
+    compactionTrackers.set(sessionID, tracker)
+  }
+
+  async function notifyCompactionEnd(sessionID: string) {
+    if (!isTGInitiatedSession(sessionID)) return
+    const tracker = compactionTrackers.get(sessionID)
+    const chatId = tracker?.chatId ?? resolveChatForSession(sessionID)
+    if (chatId == null || Number.isNaN(chatId)) return
+
+    const msg = `✅ 上下文壓縮完成\nsession: ${sessionID}`
+    await sendMsg(chatId, msg)
+    if (tracker?.progressMessageId) {
+      await editMsg(chatId, tracker.progressMessageId, `✅ 壓縮進度已完成\nsession: ${sessionID}`)
+    }
+    compactionTrackers.delete(sessionID)
   }
 
   function resolveSession(chatId: number) {
@@ -453,6 +504,7 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
     const id = (res as any)?.data?.id ?? (res as any)?.id
     if (!id) throw new Error("OpenCode did not return a session id")
     rememberSession(currentChatId ?? 0, id)
+    sessionInitiators.set(id, "tg")
     await persist()
     return id as string
   }
@@ -759,6 +811,7 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
       { command: "answer", description: "回覆 AI 提問" },
       { command: "interrupt", description: "中斷串流但保留內容" },
       { command: "continue", description: "在目前對話基礎上繼續" },
+      { command: "compaction", description: "設定上下文壓縮進度訊息" },
     ]
 
     try {
@@ -1240,6 +1293,7 @@ function stopWatchdog() {
 /abort - 中止目前任務
 /interrupt - 中斷目前串流（保留已輸出內容）
 /continue <prompt> - 在當前對話基礎上繼續
+/compaction progress on|off - 設定上下文壓縮過程是否顯示
 
 /session new - 新建 session
 /session list - 列出 session
@@ -1366,6 +1420,7 @@ function stopWatchdog() {
         `default model: ${defaultModel || "(none)"}`,
         `active model: ${state.activeModelByChat[String(chatId)] || defaultModel || "(none)"}`,
         `current session: ${resolveSession(chatId) ?? "(none)"}`,
+        `compaction progress: ${state.showCompactionProgress ? "on" : "off"}`,
         `poll interval: ${pollIntervalMs}ms`,
         `approval timeout: ${requestTimeoutMs}ms`,
         `opencode port: ${opencodePort}`,
@@ -1437,6 +1492,7 @@ function stopWatchdog() {
     if (t === "/session new") {
       try {
         const id = await createSession()
+        sessionInitiators.set(id, "tg")
         await sendMsg(chatId, `✅ 新建 session: ${id}`)
       } catch (err) {
         await sendMsg(chatId, `建立失敗: ${summarizeError(err).slice(0, 200)}`)
@@ -1505,6 +1561,23 @@ function stopWatchdog() {
       return
     }
 
+    if (t.startsWith("/compaction ")) {
+      const rest = t.slice("/compaction ".length).trim()
+      if (!rest.startsWith("progress ")) {
+        await sendMsg(chatId, "用法：/compaction progress on|off")
+        return
+      }
+      const mode = rest.slice("progress ".length).trim().toLowerCase()
+      if (!["on", "off"].includes(mode)) {
+        await sendMsg(chatId, "用法：/compaction progress on|off")
+        return
+      }
+      state.showCompactionProgress = mode === "on"
+      await persist()
+      await sendMsg(chatId, `✅ 壓縮過程顯示已設為 ${mode}`)
+      return
+    }
+
     // /model list
     if (t === "/model list") {
       const models = await listModels()
@@ -1552,6 +1625,7 @@ function stopWatchdog() {
       let sid: string
       try {
         sid = isNew ? await createSession() : (resolveSession(chatId) ?? await createSession())
+        sessionInitiators.set(sid, "tg")
       } catch (err) {
         await sendMsg(chatId, `無法建立 session: ${summarizeError(err).slice(0, 200)}`)
         return
@@ -1758,7 +1832,7 @@ function stopWatchdog() {
           currentSessionId = sid
           const existing = state.sessions.find(s => s.id === sid)
 if (!existing) {
-            state.sessions.push({ id: sid, title: info?.title, createdAt: now(), parentID })
+            state.sessions.push({ id: sid, title: info?.title, createdAt: now(), parentID, initiatedBy: sessionInitiators.get(sid) ?? undefined })
             pruneState();
             if (parentID) {
                 await log(`subagent session detected: ${sid} (parent: ${parentID})`)
@@ -1766,12 +1840,34 @@ if (!existing) {
                 // 這裡只記錄，實際 event 會透過同一個 event hook 收到
             }
         }
+          const currentRec = state.sessions.find(s => s.id === sid)
+          if (currentRec) currentRec.initiatedBy ??= sessionInitiators.get(sid) ?? currentRec.initiatedBy
           // 如果 session 不是由 TG 發起的，記錄為 computer 發起
           if (!sessionInitiators.has(sid)) {
             sessionInitiators.set(sid, "computer")
             await log(`session ${sid} marked as initiated by computer`)
           }
+          if (info?.time?.compacting && isTGInitiatedSession(sid)) {
+            await notifyCompactionStart(sid).catch(err => log(`notifyCompactionStart error sid=${sid}: ${summarizeError(err)}`))
+          }
           await persist()
+        }
+      }
+
+      if (event?.type === "session.compacted") {
+        const sid = (event as any)?.properties?.sessionID
+        if (sid) {
+          await notifyCompactionEnd(sid).catch(err => log(`notifyCompactionEnd error sid=${sid}: ${summarizeError(err)}`))
+          compactionTrackers.delete(sid)
+          await persist()
+        }
+      }
+
+      if (event?.type === "session.status") {
+        const sid = (event as any)?.properties?.sessionID
+        const status = (event as any)?.properties?.status
+        if (sid && status?.type === "busy") {
+          await log(`session.status sid=${sid} busy`)
         }
       }
 
@@ -1780,6 +1876,7 @@ if (!existing) {
         const sid = (event as any)?.properties?.sessionID ?? (event as any)?.properties?.id
         if (sid) {
           runningSessions.delete(sid)  // 確保 busy guard 解除
+          compactionTrackers.delete(sid)
 
           // ─ 新增：檢查是否為 subagent 完成，parent 是否仍顯示 busy ────────
           const sessionRec = state.sessions.find(s => s.id === sid)
@@ -1830,6 +1927,7 @@ if (!existing) {
         const err = (event as any)?.properties?.error
         await log(`session.error sid=${sid}: ${summarizeError(err)}`)
         if (sid) runningSessions.delete(sid)
+        if (sid) compactionTrackers.delete(sid)
         const ss = sid ? streamStates.get(sid) : undefined
         if (ss) {
           streamStates.delete(sid)

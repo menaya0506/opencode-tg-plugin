@@ -52,6 +52,7 @@
 - `/session list`：列出 session
 - `/session switch <id>`：切換 session
 - `/session info`：查看目前 session 詳細資訊、token 與 context 估算
+- `/compaction progress on|off`：設定上下文壓縮過程是否顯示，預設 off
 - `/model list`：列出可用模型
 - `/model show`：顯示目前模型
 - `/model use <provider/model>`：切換模型
@@ -169,6 +170,7 @@
 - `permissionRules`
 - `session.get` / `session.list` / `session.messages`：用於 `/session info` 顯示 session 詳情與 token 統計
 - `provider.list` / `model.list` / `config.get`：用於取得模型 context limit，計算 context usage 估算值
+- `session.updated` / `session.compacted`：用於在 TG 發起的 session 壓縮時發送開始與結束通知
 
 ### 初次啟動自動註冊 TG 命令
 
@@ -188,6 +190,7 @@
 - `/answer`：回覆 AI 提問
 - `/interrupt`：中斷串流但保留內容
 - `/continue`：在目前對話基礎上繼續
+- `/compaction progress on|off`：切換壓縮過程顯示
 
 ## 疑難排解
 
