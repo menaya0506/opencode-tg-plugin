@@ -121,6 +121,12 @@
 - `watchdogMs`：session 靜止超時，單位毫秒，預設 15 分鐘
 - `streamMode`：串流輸出模式，`cover` 或 `full`，預設 `cover`
 
+### Question 回覆
+
+- `question.reply` / `question.reject` 會優先使用 SDK，並帶上 `directory` 參數
+- `/answer` 與按鈕回覆會在成功後清掉 pending 狀態與 TG inline keyboard
+- 若 SDK 回覆失敗，會保留提問並重試 timeout 流程，避免卡成假成功
+
 ## 環境變數
 
 可用環境變數覆蓋設定檔：

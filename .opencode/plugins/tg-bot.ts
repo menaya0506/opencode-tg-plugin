@@ -78,6 +78,9 @@ type PendingQuestion = {
   requestID: string
   sessionID?: string
   chatId: number
+  messageId?: number
+  messageIds?: number[]
+  responding?: boolean
   questions: QuestionItem[]
   createdAt: number
   timer: ReturnType<typeof setTimeout>
@@ -329,11 +332,13 @@ async function appendLog(file: string, msg: string) {
 
 // ─── Telegram API ──────────────────────────────────────────────────────────
 
-async function tgPost(token: string, method: string, body: Record<string, unknown>) {
+async function tgPost(token: string, method: string, body: Record<string, unknown>, timeoutMs?: number) {
+  const signal = timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined
   const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
+    ...(signal ? { signal } : {}),
   })
   if (!res.ok) {
     const txt = await res.text().catch(() => "")
@@ -355,6 +360,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
   const stateDir = process.env.TG_PLUGIN_STATE_DIR ?? path.join(projectRoot, ".opencode", "tg-plugin")
   const stateFile = path.join(stateDir, "state.json")
   const logFile = path.join(stateDir, "log.txt")
+  const lockFile = path.join(stateDir, "tg-plugin.lock")
 
   fsSync.mkdirSync(stateDir, { recursive: true })
 
@@ -371,7 +377,7 @@ export const TelegramPlugin: Plugin = async (ctx) => {
       : parseCsv(process.env.TG_ALLOW_CHAT_IDS)
   )
   const defaultModel = (process.env.TG_DEFAULT_MODEL ?? fileSettings.defaultModel ?? "").trim()
-  const pollIntervalMs = Number(process.env.TG_POLL_INTERVAL_MS ?? fileSettings.pollIntervalMs ?? 2000)
+  const pollIntervalMs = Number(process.env.TG_POLL_INTERVAL_MS ?? fileSettings.pollIntervalMs ?? 500)
   const requestTimeoutMs = Number(process.env.TG_REQUEST_TIMEOUT_MS ?? fileSettings.requestTimeoutMs ?? 120000)
   const enabledFromConfig = parseToggle(fileSettings.enabled) ?? parseToggle(process.env.TG_PLUGIN_ENABLED) ?? true
   const streamModeFromConfig = (process.env.TG_STREAM_MODE ?? fileSettings.streamMode ?? "cover").toString().toLowerCase() === "full" ? "full" : "cover"
@@ -460,6 +466,8 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
   let currentChatId: number | undefined
   let currentSessionId: string | undefined = state.currentSessionByChat[Object.keys(state.currentSessionByChat)[0]]
   let pollStopped = false
+  // 每次 plugin init 產生唯一 instanceId，寫入 lock file；舊 instance 偵測到 lock 變更後自動退出
+  const instanceId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
 
   const persist = () => writeJson(stateFile, state).catch(() => undefined)
 
@@ -467,9 +475,12 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
 
   async function ocFetch(path: string, opts?: RequestInit) {
     // 使用從 ctx.client 萃取的正確 base URL（含動態 port）
+    const headers = new Headers(opts?.headers)
+    headers.set("content-type", "application/json")
+    const { headers: _headers, ...rest } = opts ?? {}
     return fetch(`${_clientBaseUrl}${path}`, {
-      headers: { "content-type": "application/json" },
-      ...opts,
+      ...rest,
+      headers,
     })
   }
 
@@ -498,8 +509,33 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
     return entry ? Number(entry[0]) : currentChatId
   }
 
-  function isTGInitiatedSession(sessionID?: string) {
-    return !!sessionID && sessionInitiators.get(sessionID) === "tg"
+  function isTGInitiatedSession(sessionID?: string): boolean {
+    if (!sessionID) return false
+    // 先查 in-memory initiators map
+    const direct = sessionInitiators.get(sessionID)
+    if (direct === "tg") return true
+    if (direct === "computer") return false
+    // fallback：查 state.sessions 的 initiatedBy 欄位（重啟後 in-memory map 是空的）
+    const directRec = state.sessions.find(s => s.id === sessionID)
+    if (directRec?.initiatedBy === "tg") return true
+    if (directRec?.initiatedBy === "computer") return false
+    // 沿著 parent chain 往上找（最多 10 層避免無限循環）
+    let sid: string | undefined = sessionID
+    const visited = new Set<string>()
+    for (let i = 0; i < 10 && sid; i++) {
+      if (visited.has(sid)) break
+      visited.add(sid)
+      const rec = state.sessions.find(s => s.id === sid)
+      if (!rec?.parentID) break
+      sid = rec.parentID
+      const parentInitiator = sessionInitiators.get(sid)
+      if (parentInitiator === "tg") return true
+      if (parentInitiator === "computer") return false
+      const parentRec = state.sessions.find(s => s.id === sid)
+      if (parentRec?.initiatedBy === "tg") return true
+      if (parentRec?.initiatedBy === "computer") return false
+    }
+    return false
   }
 
   async function notifyCompactionStart(sessionID: string) {
@@ -580,8 +616,22 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
       const res = await (client as any).session.messages({ sessionID: sessionId, limit: 1000 })
       const data = (res as any)?.data ?? res
       const msgs = Array.isArray(data) ? data : []
-      summary.messages = Math.max(summary.messages, msgs.length)
-      syncUsageFromMessages(summary, msgs as any)
+      const usage = syncUsageFromMessages(msgs as any)
+      summary.messages = Math.max(summary.messages, usage.messages)
+      summary.userMessages = usage.userMessages
+      summary.assistantMessages = usage.assistantMessages
+      summary.promptTokens = usage.promptTokens
+      summary.completionTokens = usage.completionTokens
+      summary.reasoningTokens = usage.reasoningTokens
+      summary.cacheReadTokens = usage.cacheReadTokens
+      summary.cacheWriteTokens = usage.cacheWriteTokens
+      summary.totalTokens = usage.totalTokens
+      summary.latestPromptTokens = usage.latestPromptTokens
+      summary.latestCompletionTokens = usage.latestCompletionTokens
+      summary.latestReasoningTokens = usage.latestReasoningTokens
+      summary.latestCacheReadTokens = usage.latestCacheReadTokens
+      summary.latestCacheWriteTokens = usage.latestCacheWriteTokens
+      summary.latestTotalTokens = usage.latestTotalTokens
     } catch (err) {
       await log(`getSessionTokenSummary error sid=${sessionId}: ${summarizeError(err)}`)
     }
@@ -881,6 +931,90 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
     }).catch(() => undefined)
   }
 
+  async function clearQuestionCard(chatId: number, messageId?: number) {
+    if (!token || !messageId) return
+    await tgPost(token, "editMessageReplyMarkup", {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: { inline_keyboard: [] },
+    }).catch(() => undefined)
+  }
+
+  async function clearQuestionCards(chatId: number, messageIds?: number[]) {
+    if (!messageIds?.length) return
+    for (const messageId of messageIds) {
+      await clearQuestionCard(chatId, messageId)
+    }
+  }
+
+  function clearPendingQuestion(requestID: string) {
+    const shortKey = requestID.replace(/-/g, "").slice(0, 8)
+    const pq = pendingQuestions.get(requestID) ?? pendingQuestions.get(shortKey)
+    if (pq) {
+      clearTimeout(pq.timer)
+    }
+    pendingQuestions.delete(requestID)
+    pendingQuestions.delete(shortKey)
+    return pq
+  }
+
+  function scheduleQuestionTimeout(requestID: string, chatId: number) {
+    const shortID = requestID.replace(/-/g, "").slice(0, 8)
+    return setTimeout(async () => {
+      // 在正式 reject 前，先做一次 grace poll 撈最後可能剛到的 callback
+      if (token) {
+        try {
+          const graceRes = await tgPost(token, "getUpdates", {
+            offset: state.lastUpdateId + 1,
+            timeout: 0,
+            allowed_updates: ["callback_query"],
+          }, 5000)
+          const graceUpdates = Array.isArray((graceRes as any).result) ? (graceRes as any).result as TelegramUpdate[] : []
+          for (const u of graceUpdates) {
+            const cbd = u.callback_query?.data
+            if (cbd) {
+              const m = cbd.match(/^q:([^:]+):(\d+)$/)
+              if (m) {
+                const [, sid] = m
+                const gpq = pendingQuestions.get(requestID)
+                if (gpq && (requestID.replace(/-/g, "").startsWith(sid) || requestID === sid || shortID === sid)) {
+                  await log(`grace poll: caught callback data=${cbd} before timeout fires`)
+                  // process the update normally
+                  await handleUpdate(u).catch(() => undefined)
+                  state.lastUpdateId = Math.max(state.lastUpdateId, u.update_id)
+                  await persist()
+                  // if pq was resolved by handleUpdate, stop timeout handler
+                  if (!pendingQuestions.has(requestID) && !pendingQuestions.has(shortID)) {
+                    await log(`grace poll: question ${shortID} resolved via callback, skipping reject`)
+                    return
+                  }
+                } else {
+                  // unrelated update, process it too so we don't skip it
+                  await handleUpdate(u).catch(() => undefined)
+                  state.lastUpdateId = Math.max(state.lastUpdateId, u.update_id)
+                }
+              } else {
+                await handleUpdate(u).catch(() => undefined)
+                state.lastUpdateId = Math.max(state.lastUpdateId, u.update_id)
+              }
+            } else {
+              await handleUpdate(u).catch(() => undefined)
+              state.lastUpdateId = Math.max(state.lastUpdateId, u.update_id)
+            }
+          }
+          if (graceUpdates.length > 0) await persist()
+        } catch { /* grace poll failure is non-fatal */ }
+      }
+
+      const pq = clearPendingQuestion(requestID)
+      if (!pq) return
+      // 清掉 TG 上的按鈕（防止用戶在 timeout 後仍嘗試點擊）
+      await clearQuestionCards(chatId, pq.messageIds ?? (pq.messageId ? [pq.messageId] : []))
+      await rejectQuestion(requestID)
+      await sendMsg(chatId, `⏰ AI 提問逾時，已自動拒絕\nid: ${shortID}`)
+    }, requestTimeoutMs)
+  }
+
   // ─── Stream 推送邏輯 ────────────────────────────────────────────────────
 
 async function handleStreamPart(sessionId: string, text: string) {
@@ -1144,8 +1278,8 @@ function chunkByLength(text: string, maxLen: number) {
     const patterns = Array.isArray(props?.patterns) ? props.patterns : []
     const pattern = patterns.join(", ")
 
-    // 檢查 session 是否由 TG 發起，如果不是則不轉發到 Telegram
-    if (sessionID && sessionInitiators.get(sessionID) !== "tg") {
+    // 檢查 session 是否由 TG 發起（含 parent chain），如果不是則不轉發到 Telegram
+    if (sessionID && !isTGInitiatedSession(sessionID)) {
       await log(`permission.asked: session ${sessionID} not initiated by TG, ignoring`)
       if (output) output.status = "deny"
       return
@@ -1214,33 +1348,91 @@ function chunkByLength(text: string, maxLen: number) {
 
   // ─── 新增：Question 流程 ─────────────────────────────────────────────────
 
+  /**
+   * 使用 SDK 底層 _client.post() 發送請求（繞過 401 問題）
+   * _client 是 HeyApi HTTP 客戶端，已正確設定 baseURL 與攔截器
+   */
+  async function sdkPost(urlTemplate: string, pathParams?: Record<string, string>, body?: unknown, query?: Record<string, string>) {
+    const clientAny = client as any
+    const underlyingClient = clientAny?._client
+    if (underlyingClient && typeof underlyingClient.post === "function") {
+      // 使用 SDK 底層客戶端，自動帶入 baseURL 與所有 interceptors
+      // HeyApi client.post({ url, path, query, body, headers }) 會自動處理 URL 模板替換與查詢字串
+      return underlyingClient.post({
+        url: urlTemplate,
+        ...(pathParams ? { path: pathParams } : {}),
+        ...(query ? { query } : {}),
+        ...(body !== undefined ? { body } : {}),
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+    // fallback：raw fetch
+    return null
+  }
+
   async function replyQuestion(requestID: string, answers: string[][]) {
     try {
       const clientAny = client as any
       await log(`question.reply try requestID=${requestID} answers=${JSON.stringify(answers)}`)
+
+      // 方法 1：如果 SDK 有 question.reply（v2 SDK）
       if (typeof clientAny.question?.reply === "function") {
-        await clientAny.question.reply({
+        const res = await clientAny.question.reply({
           requestID,
           directory: projectRoot,
-          body: { answers },
+          answers,
         })
+        const status = res?.response?.status ?? "(none)"
+        await log(`question.reply sdk.question.reply response requestID=${requestID} status=${status}`)
+        if (!res?.response?.ok || res?.error) {
+          throw new Error(`HTTP ${status}: ${summarizeError(res?.error ?? "question.reply failed")}`)
+        }
       } else {
-        // fallback：直接打 REST，補上 SDK client 的 auth headers
-        const res = await ocFetch(`/question/${encodeURIComponent(requestID)}/reply?directory=${encodeURIComponent(projectRoot)}`, {
-          method: "POST",
-          headers: {
-            ...getAuthHeaders(),
-          },
-          body: JSON.stringify({ answers }),
-        })
-        if (!res.ok) {
-          const txt = await res.text().catch(() => "")
-          throw new Error(`HTTP ${res.status}: ${txt}`)
+        // 方法 2：使用 SDK 底層 _client.post()（正確的 baseURL + interceptors）
+        const sdkResult = await sdkPost(
+          `/question/{requestID}/reply`,
+          { requestID },
+          { answers },
+          { directory: projectRoot },
+        )
+        if (sdkResult !== null) {
+          const status = sdkResult?.response?.status ?? "(none)"
+          await log(`question.reply sdk._client.post response requestID=${requestID} status=${status}`)
+          if (sdkResult?.response && !sdkResult.response.ok) {
+            const txt = await sdkResult.response.text().catch(() => "")
+            throw new Error(`HTTP ${status}: ${txt.slice(0, 300)}`)
+          }
+          if (sdkResult?.error) {
+            throw new Error(summarizeError(sdkResult.error))
+          }
+        } else {
+          // 方法 3：最終 fallback：raw fetch + 嘗試從 _client.getConfig() 取 headers
+          const configHeaders: Record<string, string> = {}
+          try {
+            const cfg = clientAny?._client?.getConfig?.()
+            if (cfg?.headers && typeof cfg.headers === "object") {
+              for (const [k, v] of Object.entries(cfg.headers)) {
+                if (typeof v === "string") configHeaders[k] = v
+              }
+            }
+          } catch { /* ignore */ }
+          const res = await ocFetch(`/question/${encodeURIComponent(requestID)}/reply?directory=${encodeURIComponent(projectRoot)}`, {
+            method: "POST",
+            headers: { ...getAuthHeaders(), ...configHeaders },
+            body: JSON.stringify({ answers }),
+          })
+          if (!res.ok) {
+            const txt = await res.text().catch(() => "")
+            await log(`question.reply raw fetch response requestID=${requestID} status=${res.status} body=${txt.slice(0, 500)}`)
+            throw new Error(`HTTP ${res.status}: ${txt}`)
+          }
         }
       }
       await log(`question.reply sent requestID=${requestID} answers=${JSON.stringify(answers)}`)
+      return true
     } catch (err) {
       await log(`question.reply error requestID=${requestID}: ${summarizeError(err)}`)
+      return false
     }
   }
 
@@ -1248,18 +1440,68 @@ function chunkByLength(text: string, maxLen: number) {
     try {
       const clientAny = client as any
       if (typeof clientAny.question?.reject === "function") {
-        await clientAny.question.reject({ requestID })
+        const res = await clientAny.question.reject({
+          requestID,
+          directory: projectRoot,
+        })
+        const status = res?.response?.status ?? "(none)"
+        await log(`question.reject sdk.question.reject response requestID=${requestID} status=${status}`)
+        if (!res?.response?.ok || res?.error) {
+          throw new Error(`HTTP ${status}: ${summarizeError(res?.error ?? "question.reject failed")}`)
+        }
       } else {
-        const res = await ocFetch(`/question/${requestID}/reject`, { method: "POST", headers: { ...getAuthHeaders() } })
-        if (!res.ok) {
-          const txt = await res.text().catch(() => "")
-          throw new Error(`HTTP ${res.status}: ${txt}`)
+        const sdkResult = await sdkPost(
+          `/question/{requestID}/reject`,
+          { requestID },
+          undefined,
+          { directory: projectRoot },
+        )
+        if (sdkResult !== null) {
+          const status = sdkResult?.response?.status ?? "(none)"
+          await log(`question.reject sdk._client.post response requestID=${requestID} status=${status}`)
+          if (sdkResult?.response && !sdkResult.response.ok) {
+            const txt = await sdkResult.response.text().catch(() => "")
+            throw new Error(`HTTP ${status}: ${txt.slice(0, 300)}`)
+          }
+          if (sdkResult?.error) {
+            throw new Error(summarizeError(sdkResult.error))
+          }
+        } else {
+          const res = await ocFetch(`/question/${encodeURIComponent(requestID)}/reject?directory=${encodeURIComponent(projectRoot)}`, { method: "POST", headers: { ...getAuthHeaders() } })
+          if (!res.ok) {
+            const txt = await res.text().catch(() => "")
+            await log(`question.reject rest response requestID=${requestID} status=${res.status} body=${txt.slice(0, 500)}`)
+            throw new Error(`HTTP ${res.status}: ${txt}`)
+          }
         }
       }
       await log(`question.reject sent requestID=${requestID}`)
+      return true
     } catch (err) {
       await log(`question.reject error requestID=${requestID}: ${summarizeError(err)}`)
+      return false
     }
+  }
+
+  async function respondToQuestion(pq: PendingQuestion, answers: string[][]): Promise<"sent" | "already-processed" | "failed"> {
+    if (pq.responding) return "already-processed"
+
+    pq.responding = true
+    clearTimeout(pq.timer)
+    const shortKey = pq.requestID.replace(/-/g, "").slice(0, 8)
+
+    const ok = await replyQuestion(pq.requestID, answers)
+    if (!ok) {
+      const stillPending = pendingQuestions.get(pq.requestID) === pq || pendingQuestions.get(shortKey) === pq
+      if (!stillPending) return "already-processed"
+      pq.responding = false
+      pq.timer = scheduleQuestionTimeout(pq.requestID, pq.chatId)
+      return "failed"
+    }
+
+    await clearQuestionCards(pq.chatId, pq.messageIds ?? (pq.messageId ? [pq.messageId] : []))
+    clearPendingQuestion(pq.requestID)
+    return "sent"
   }
 
   async function handleQuestionAsked(props: any) {
@@ -1274,8 +1516,8 @@ function chunkByLength(text: string, maxLen: number) {
       options: Array.isArray(q?.options) ? q.options : undefined,
     }))
 
-    // 檢查 session 是否由 TG 發起，如果不是則不轉發到 Telegram
-    if (sessionID && sessionInitiators.get(sessionID) !== "tg") {
+    // 檢查 session 是否由 TG 發起（含 parent chain），如果不是則不轉發到 Telegram
+    if (sessionID && !isTGInitiatedSession(sessionID)) {
       await log(`question.asked: session ${sessionID} not initiated by TG, ignoring`)
       return
     }
@@ -1303,22 +1545,23 @@ function chunkByLength(text: string, maxLen: number) {
 
     // 短 ID 先產生，供 timer 與後續使用
     const shortID = requestID.replace(/-/g, "").slice(0, 8)
-    const timer = setTimeout(async () => {
-      const shortKey = requestID.replace(/-/g, "").slice(0, 8)
-      pendingQuestions.delete(requestID)
-      pendingQuestions.delete(shortKey)
-      await rejectQuestion(requestID)
-      await sendMsg(chatId, `⏰ AI 提問逾時，已自動拒絕\nid: ${shortID}`)
-    }, requestTimeoutMs)
+    const timer = scheduleQuestionTimeout(requestID, chatId)
 
-    pendingQuestions.set(requestID, { requestID, sessionID, chatId, questions, createdAt: now(), timer })
+    pendingQuestions.set(requestID, { requestID, sessionID, chatId, questions, createdAt: now(), timer, responding: false, messageIds: [] })
 
     // 用於 callback 的短 ID（取前 8 碼，確保 callback_data 在 64 bytes 內）
     // 格式：q:<8碼>:<選項索引> 最長 = 2+1+8+1+2 = 14 bytes，遠低於 64 限制
 
     // 發送每個問題
     let globalIdx = 0;
+    const currentPending = pendingQuestions.get(requestID)!
     for (const q of questions) {
+      const activePending = pendingQuestions.get(requestID) ?? pendingQuestions.get(shortID)
+      if (activePending !== currentPending || activePending?.responding) {
+        await log(`question.asked: stopped sending remaining questions requestID=${requestID} shortID=${shortID}`)
+        break
+      }
+
       const hasOptions = Array.isArray(q.options) && q.options.length > 0
 
       const lines = [
@@ -1348,6 +1591,23 @@ function chunkByLength(text: string, maxLen: number) {
         : {}
 
       const mid = await sendMsg(chatId, lines, keyboard)
+      const stillActive = pendingQuestions.get(requestID) ?? pendingQuestions.get(shortID)
+      if (mid && (stillActive !== currentPending || stillActive?.responding)) {
+        await clearQuestionCard(chatId, mid)
+        await log(`question.asked: cleared late-sent card requestID=${requestID} shortID=${shortID} msgId=${mid}`)
+        break
+      }
+      if (stillActive !== currentPending || stillActive?.responding) {
+        await log(`question.asked: question already handled while sending requestID=${requestID} shortID=${shortID}`)
+        break
+      }
+      if (mid) {
+        const existing = pendingQuestions.get(requestID)
+        if (existing) {
+          existing.messageId = existing.messageId ?? mid
+          existing.messageIds = [...(existing.messageIds ?? []), mid]
+        }
+      }
       await log(`question.asked: sent msgId=${mid} shortID=${shortID} hasOptions=${hasOptions}`)
     }
 
@@ -1447,11 +1707,20 @@ function chunkByLength(text: string, maxLen: number) {
         return
       }
 
-      const shortKey = pq.requestID.replace(/-/g, "").slice(0, 8)
-      clearTimeout(pq.timer)
-      pendingQuestions.delete(pq.requestID)
-      pendingQuestions.delete(shortKey)
-      await replyQuestion(pq.requestID, [[answer]])
+      if (pq.responding) {
+        await sendMsg(chatId, `這則 AI 提問正在回覆中，請稍後再試`)
+        return
+      }
+
+      const result = await respondToQuestion(pq, [[answer]])
+      if (result === "already-processed") {
+        await sendMsg(chatId, `這則 AI 提問已被處理，請稍後確認結果`)
+        return
+      }
+      if (result === "failed") {
+        await sendMsg(chatId, `❌ 回覆 AI 提問失敗，請稍後再試`)
+        return
+      }
       await sendMsg(chatId, `✅ 已回覆 AI 提問`)
       return
     }
@@ -1581,12 +1850,11 @@ function chunkByLength(text: string, maxLen: number) {
         sessionInitiators.set(sid, "tg")
       }
       
-      try {
-        await runPrompt(chatId, prompt, sid)
-      } catch (err) {
+      // 非阻塞執行：同 /run，避免阻塞 poll loop
+      void runPrompt(chatId, prompt, sid).catch(async (err) => {
         await log(`continue error: ${summarizeError(err)}`)
         await sendMsg(chatId, `❌ 繼續對話失敗: ${summarizeError(err).slice(0, 200)}`)
-      }
+      })
       return
     }
 
@@ -1751,13 +2019,12 @@ function chunkByLength(text: string, maxLen: number) {
       // 記錄這個 session 是由 TG 發起的
       sessionInitiators.set(sid, "tg")
       
-      // 等待 runPrompt 完成，避免競態條件
-      try {
-        await runPrompt(chatId, prompt, sid)
-      } catch (err) {
+      // 非阻塞執行：不 await runPrompt，避免 session.prompt 阻塞 poll loop
+      // （LLM 若問 question，poll loop 才能收到 callback 回覆）
+      void runPrompt(chatId, prompt, sid).catch(async (err) => {
         await log(`runPrompt error: ${summarizeError(err)}`)
         await sendMsg(chatId, `❌ 執行過程中發生錯誤: ${summarizeError(err).slice(0, 200)}`)
-      }
+      })
       return
     }
 
@@ -1777,6 +2044,10 @@ function chunkByLength(text: string, maxLen: number) {
 
     const cbData = update.callback_query?.data
     const cbChatId = update.callback_query?.message?.chat?.id
+    // debug：記錄所有 callback_query update
+    if (update.callback_query) {
+      await log(`callback_query: id=${update.callback_query.id} data=${cbData} chatId=${cbChatId} update_id=${update.update_id}`)
+    }
     if (cbData && cbChatId != null) {
       currentChatId = cbChatId
 
@@ -1799,18 +2070,25 @@ function chunkByLength(text: string, maxLen: number) {
           (q.requestID.replace(/-/g, "").startsWith(shortID) || q.requestID === shortID)
         )
         if (pq) {
+          if (pq.responding) {
+            await answerCallback(update.callback_query!.id, "回覆中，請稍後")
+            return
+          }
           const idx = parseInt(idxStr, 10)
           // 找對應問題的選項
           const rawAnswer = pq.questions.flatMap(q => q.options ?? []).at(idx) ?? idxStr
           const answer = (typeof rawAnswer === "object" && rawAnswer !== null)
             ? ((rawAnswer as any).label ?? (rawAnswer as any).text ?? JSON.stringify(rawAnswer))
             : rawAnswer;
-          // 清除所有 shortID 的 key
-          const shortKey = pq.requestID.replace(/-/g, "").slice(0, 8)
-          clearTimeout(pq.timer)
-          pendingQuestions.delete(pq.requestID)
-          pendingQuestions.delete(shortKey)
-          await replyQuestion(pq.requestID, [[answer]])
+          const result = await respondToQuestion(pq, [[answer]])
+          if (result === "already-processed") {
+            await answerCallback(update.callback_query!.id, "已處理，請稍後確認結果")
+            return
+          }
+          if (result === "failed") {
+            await answerCallback(update.callback_query!.id, "回覆失敗，請稍後再試")
+            return
+          }
           // 觸發 TUI 重新渲染，讓問題選單立即消失，不需要手動點擊
           try {
             const clientAny = client as any
@@ -1839,9 +2117,16 @@ function chunkByLength(text: string, maxLen: number) {
       return
     }
 
-    await log(`poll started; allowChatIds=${[...allowChatIds].join(",")}`)
+    await log(`poll started; instanceId=${instanceId}; allowChatIds=${[...allowChatIds].join(",")}`)
 
     while (true) {
+      // 每次循環開始前檢查 lock file：若不是自己的 instanceId 則退出（新 instance 已取代）
+      const currentLock = await fs.readFile(lockFile, "utf8").catch(() => "")
+      if (currentLock.trim() !== instanceId) {
+        await log(`poll: instanceId mismatch (lock=${currentLock.trim().slice(0, 20)}, mine=${instanceId}), stopping old instance poll loop`)
+        return
+      }
+
       if (pollStopped) {
         await new Promise(r => setTimeout(r, 10000))
         continue
@@ -1853,15 +2138,20 @@ function chunkByLength(text: string, maxLen: number) {
 
       try {
         state.lastPollAt = now()
+        const pollStart = Date.now()
         const res = await tgPost(token, "getUpdates", {
           offset: state.lastUpdateId + 1,
-          timeout: 20,
+          timeout: 0,   // short polling：立刻回傳，用 pollIntervalMs 控制頻率
           allowed_updates: ["message", "callback_query"],
-        })
+        }, 15000) // 15 秒 abort（short poll 應該幾乎立刻回來）
+        const pollMs = Date.now() - pollStart
         state.lastPollOkAt = now()
         state.lastError = undefined
 
         const updates = Array.isArray((res as any).result) ? (res as any).result as TelegramUpdate[] : []
+        if (updates.length > 0) {
+          await log(`poll: ${updates.length} updates, types=${updates.map(u => u.callback_query ? "callback" : u.message ? "msg" : "other").join(",")}`)
+        }
         for (const update of updates) {
           // 先處理，成功後才推進 offset，避免失敗時跳過後續訊息
           await handleUpdate(update).catch(err =>
@@ -1870,6 +2160,8 @@ function chunkByLength(text: string, maxLen: number) {
           state.lastUpdateId = Math.max(state.lastUpdateId, update.update_id)
         }
         await persist()
+        // short polling：每次 cycle 後等 pollIntervalMs（1500ms 預設）
+        await new Promise(r => setTimeout(r, pollIntervalMs))
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         state.lastError = msg.slice(0, 500)
@@ -1889,8 +2181,14 @@ function chunkByLength(text: string, maxLen: number) {
 
   // ─── 初始化 ──────────────────────────────────────────────────────────────
 
-  await log(`plugin init; token=${Boolean(token)}; enabled=${state.enabled}; dir=${projectRoot}`)
+  // 寫入 instance lock file（讓舊的 poll loop 自動退出）
+  await fs.writeFile(lockFile, instanceId, "utf8").catch(() => undefined)
+
+  await log(`plugin init; instanceId=${instanceId}; token=${Boolean(token)}; enabled=${state.enabled}; dir=${projectRoot}`)
   await log(`ocFetch baseURL=${_clientBaseUrl}`)
+  // debug: 確認 _client 是否可用（用於 question reply 繞過 401）
+  const _dbgClient = (client as any)?._client
+  await log(`sdk._client available=${Boolean(_dbgClient && typeof _dbgClient.post === "function")}; _client.getConfig.baseUrl=${_dbgClient?.getConfig?.()?.baseUrl ?? "(none)"}`)
 
   void registerTelegramCommands()
 
@@ -1939,6 +2237,20 @@ function chunkByLength(text: string, maxLen: number) {
         return
       }
 
+      if (event?.type === "question.replied" || event?.type === "question.rejected") {
+        const props = (event as any)?.properties ?? {}
+        const requestID = props?.requestID
+        if (requestID) {
+          const shortID = requestID.replace(/-/g, "").slice(0, 8)
+          const pq = clearPendingQuestion(requestID)
+          if (pq) {
+            await clearQuestionCards(pq.chatId, pq.messageIds ?? (pq.messageId ? [pq.messageId] : []))
+            await log(`question.${event.type === "question.replied" ? "replied" : "rejected"} cleanup requestID=${requestID} shortID=${shortID}`)
+          }
+        }
+        return
+      }
+
       // ─ 新增：追蹤 subagent session ─────────────────────────────────────
       // session.created 時，若有 parentID，記錄為 subagent
       if (event?.type === "session.created" || event?.type === "session.updated") {
@@ -1958,11 +2270,22 @@ if (!existing) {
             }
         }
           const currentRec = state.sessions.find(s => s.id === sid)
-          if (currentRec) currentRec.initiatedBy ??= sessionInitiators.get(sid) ?? currentRec.initiatedBy
-          // 如果 session 不是由 TG 發起的，記錄為 computer 發起
+          if (currentRec && !currentRec.initiatedBy) {
+            currentRec.initiatedBy = sessionInitiators.get(sid) ?? currentRec.initiatedBy
+          }
+          // 如果 session 不是由 TG 發起的，先檢查是否為 subagent（parent 是 TG 發起）
           if (!sessionInitiators.has(sid)) {
-            sessionInitiators.set(sid, "computer")
-            await log(`session ${sid} marked as initiated by computer`)
+            // subagent 繼承 parent 的 initiator（用 isTGInitiatedSession 也查 state.sessions）
+            if (parentID && isTGInitiatedSession(parentID)) {
+              sessionInitiators.set(sid, "tg")
+              // 同步更新 state.sessions
+              const sRec = state.sessions.find(s => s.id === sid)
+              if (sRec) sRec.initiatedBy = "tg"
+              await log(`session ${sid} marked as initiated by tg (inherited from parent ${parentID})`)
+            } else {
+              sessionInitiators.set(sid, "computer")
+              await log(`session ${sid} marked as initiated by computer`)
+            }
           }
           if (info?.time?.compacting && isTGInitiatedSession(sid)) {
             await notifyCompactionStart(sid).catch(err => log(`notifyCompactionStart error sid=${sid}: ${summarizeError(err)}`))
