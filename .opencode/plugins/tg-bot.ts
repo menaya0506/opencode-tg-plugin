@@ -1102,7 +1102,7 @@ async function handleStreamPart(sessionId: string, text: string) {
     }
 }
 
-  async function handleStreamDone(sessionId: string) {
+  async function handleStreamDone(sessionId: string, announceConversationEnd = false) {
     const ss = streamStates.get(sessionId)
     if (!ss) return
     if (ss.done) { streamStates.delete(sessionId); return }  // 避免 leak：已完成但未清理的 entry
@@ -1139,6 +1139,9 @@ async function handleStreamPart(sessionId: string, text: string) {
     }
 
     streamStates.delete(sessionId)
+    if (announceConversationEnd) {
+      await sendMsg(ss.chatId, `對話已結束\nsession: ${sessionId}`)
+    }
     await log(`stream done sid=${sessionId} totalLen=${finalText.length} chunks=${chunkCount}`)
   }
 
@@ -2348,12 +2351,13 @@ if (!existing) {
       if (event?.type === "session.idle") {
         const sid = (event as any)?.properties?.sessionID ?? (event as any)?.properties?.id
         if (sid) {
+          const sessionRec = state.sessions.find(s => s.id === sid)
+          const announceConversationEnd = Boolean(sessionRec && !sessionRec.parentID && isTGInitiatedSession(sid))
           runningSessions.delete(sid)  // 確保 busy guard 解除
           sessionInitiators.delete(sid) // 防止 sessionInitiators 無限增長
           compactionTrackers.delete(sid)
 
           // ─ 新增：檢查是否為 subagent 完成，parent 是否仍顯示 busy ────────
-          const sessionRec = state.sessions.find(s => s.id === sid)
           if (sessionRec?.parentID) {
             const parentID = sessionRec.parentID
             if (runningSessions.has(parentID)) {
@@ -2362,7 +2366,7 @@ if (!existing) {
             }
           }
 
-          await handleStreamDone(sid).catch(err =>
+          await handleStreamDone(sid, announceConversationEnd).catch(err =>
             log(`stream done error: ${summarizeError(err)}`)
           )
         }
