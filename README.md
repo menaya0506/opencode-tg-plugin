@@ -67,6 +67,7 @@
 - 輪詢改為 short polling（預設 500ms），並使用 instance lock 避免插件重新載入時重複啟動 polling loop。
 - 新增 watchdog 句柄在插件重新載入時會正確清除，避免多重計時器。
 - `permission` 與 `question` callback 會直接回到 Telegram，若非 Telegram 發起的 session（如由電腦端觸發），則會自動忽略。
+- 確認在OpenCode V1.4.1版上可運作
 
 ### 授權流程
 
