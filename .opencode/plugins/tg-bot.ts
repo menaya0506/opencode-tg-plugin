@@ -594,7 +594,7 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
 
   async function createSession() {
     const res = await client.session.create({ body: {} })
-    const id = (res as any)?.data?.id ?? (res as any)?.id
+    const id = res.data?.id ?? (res as any)?.id
     if (!id) throw new Error("OpenCode did not return a session id")
     rememberSession(currentChatId ?? 0, id)
     sessionInitiators.set(id, "tg")
@@ -605,7 +605,7 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
   async function listSessions(): Promise<SessionRecord[]> {
     try {
       const res = await client.session.list()
-      const data = (res as any)?.data ?? res
+      const data = res.data ?? res
       if (Array.isArray(data)) {
         return data
           .map((item: any) => ({
@@ -636,8 +636,8 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
     }
 
     try {
-      const res = await (client as any).session.messages({ sessionID: sessionId, limit: 1000 })
-      const data = (res as any)?.data ?? res
+      const res = await client.session.messages({ path: { id: sessionId }, query: { limit: 1000 } })
+      const data = res.data ?? res
       const msgs = Array.isArray(data) ? data : []
       const usage = syncUsageFromMessages(msgs as any)
       summary.messages = Math.max(summary.messages, usage.messages)
@@ -682,12 +682,12 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
 
   async function getSessionInfo(sessionId: string) {
     try {
-      const res = await client.session.get({ sessionID: sessionId })
-      const info = ((res as any)?.data ?? res) as any
+      const res = await client.session.get({ path: { id: sessionId } })
+      const info = (res.data ?? res) as any
       if (info?.time?.updated) return info
 
       const listRes = await client.session.list()
-      const listData = (listRes as any)?.data ?? listRes
+      const listData = listRes.data ?? listRes
       const fromList = Array.isArray(listData) ? listData.find((s: any) => s?.id === sessionId) : undefined
       if (fromList) {
         return {
@@ -771,8 +771,8 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
 
   async function getSessionChildrenCount(sessionId: string) {
     try {
-      const res = await client.session.children({ sessionID: sessionId })
-      const data = (res as any)?.data ?? res
+      const res = await client.session.children({ path: { id: sessionId } })
+      const data = res.data ?? res
       return Array.isArray(data) ? data.length : 0
     } catch {
       return 0
@@ -782,7 +782,7 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
   async function getSessionStatus(sessionId: string) {
     try {
       const res = await client.session.status()
-      const data = (res as any)?.data ?? res
+      const data = (res.data ?? res) as Record<string, any>
       return data?.[sessionId]
     } catch {
       return undefined
@@ -800,8 +800,8 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
     if (!model) return undefined
 
     try {
-      const res = await (client as any).provider.list()
-      const data = (res as any)?.data ?? res
+      const res = await client.provider.list()
+      const data = (res.data ?? res) as any
       const providers = Array.isArray(data) ? data : Array.isArray(data?.all) ? data.all : []
       const foundProvider = providers.find((p: any) => (p?.id ?? p?.providerID) === model.providerID)
       const limit = foundProvider?.models?.[model.modelID]?.limit?.context
@@ -810,20 +810,24 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
       await log(`getModelContextLimit provider.list error model=${modelName ?? "(none)"}: ${summarizeError(err)}`)
     }
 
-    try {
-      const res = await (client as any).model.list()
-      const data = (res as any)?.data ?? res
-      const models = Array.isArray(data) ? data : Array.isArray(data?.all) ? data.all.flatMap((p: any) => Object.values(p?.models ?? {})) : []
-      const found = models.find((m: any) => (m?.providerID ?? m?.provider?.id) === model.providerID && (m?.id ?? m?.modelID) === model.modelID)
-      const limit = found?.limit?.context
-      if (Number(limit) > 0) return Number(limit)
-    } catch (err) {
-      await log(`getModelContextLimit model.list error model=${modelName ?? "(none)"}: ${summarizeError(err)}`)
+    // NOTE: v1 SDK 沒有 client.model 命名空間，僅 v2 才有。
+    // 保留此分支以便未來升級到 v2 SDK 時自動啟用。
+    if (typeof (client as any).model?.list === "function") {
+      try {
+        const res = await (client as any).model.list()
+        const data = (res as any)?.data ?? res
+        const models = Array.isArray(data) ? data : Array.isArray(data?.all) ? data.all.flatMap((p: any) => Object.values(p?.models ?? {})) : []
+        const found = models.find((m: any) => (m?.providerID ?? m?.provider?.id) === model.providerID && (m?.id ?? m?.modelID) === model.modelID)
+        const limit = found?.limit?.context
+        if (Number(limit) > 0) return Number(limit)
+      } catch (err) {
+        await log(`getModelContextLimit model.list error model=${modelName ?? "(none)"}: ${summarizeError(err)}`)
+      }
     }
 
     try {
       const res = await client.config.get()
-      const cfg = (res as any)?.data ?? res
+      const cfg = (res.data ?? res) as any
       const limit = cfg?.provider?.[model.providerID]?.models?.[model.modelID]?.limit?.context
       return Number(limit) || undefined
     } catch (err) {
@@ -835,33 +839,36 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
   // ─── 修改：listModels 支援動態 OAuth provider ────────────────────────────
 
   async function listModels(): Promise<string[]> {
-    // 優先嘗試動態模型清單（包含 GitHub Copilot 等 OAuth provider）
-    try {
-      const res = await (client as any).model.list()
-      const data = (res as any)?.data ?? res
-      const models = Array.isArray(data)
-        ? data
-        : Array.isArray(data?.all)
-          ? data.all.flatMap((p: any) => Object.values(p?.models ?? {}).map((m: any) => ({ provider: p?.id ?? p?.providerID ?? "", model: m?.id ?? m?.modelID ?? "" })))
-          : []
-      if (models.length > 0) {
-        return models
-          .map((m: any) => {
-            const provider = m?.provider?.id ?? m?.providerID ?? m?.provider ?? m?.provider ?? ""
-            const model = m?.id ?? m?.modelID ?? m?.model ?? ""
-            return provider && model ? `${provider}/${model}` : null
-          })
-          .filter(Boolean)
-          .sort() as string[]
+    // NOTE: v1 SDK 沒有 client.model 命名空間，僅 v2 才有。
+    // 保留此分支以便未來升級到 v2 SDK 時自動啟用。
+    if (typeof (client as any).model?.list === "function") {
+      try {
+        const res = await (client as any).model.list()
+        const data = (res as any)?.data ?? res
+        const models = Array.isArray(data)
+          ? data
+          : Array.isArray(data?.all)
+            ? data.all.flatMap((p: any) => Object.values(p?.models ?? {}).map((m: any) => ({ provider: p?.id ?? p?.providerID ?? "", model: m?.id ?? m?.modelID ?? "" })))
+            : []
+        if (models.length > 0) {
+          return models
+            .map((m: any) => {
+              const provider = m?.provider?.id ?? m?.providerID ?? m?.provider ?? m?.provider ?? ""
+              const model = m?.id ?? m?.modelID ?? m?.model ?? ""
+              return provider && model ? `${provider}/${model}` : null
+            })
+            .filter(Boolean)
+            .sort() as string[]
+        }
+      } catch (err) {
+        await log(`listModels (dynamic) error: ${summarizeError(err)}`)
       }
-    } catch (err) {
-      await log(`listModels (dynamic) error: ${summarizeError(err)}`)
     }
 
     // fallback：從靜態設定讀取
     try {
       const res = await client.config.get()
-      const cfg = (res as any)?.data ?? res
+      const cfg = (res.data ?? res) as any
       const names: string[] = []
       for (const [pid, provider] of Object.entries(cfg?.provider ?? {})) {
         for (const mid of Object.keys((provider as any)?.models ?? {})) {
@@ -895,7 +902,7 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
         }
         return null
       })
-      lastMsgId = (res as any)?.result?.message_id as number | undefined
+      lastMsgId = (res?.result as { message_id?: number } | undefined)?.message_id
     }
     return lastMsgId
   }
@@ -992,7 +999,7 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
             timeout: 0,
             allowed_updates: ["callback_query"],
           }, 5000)
-          const graceUpdates = Array.isArray((graceRes as any).result) ? (graceRes as any).result as TelegramUpdate[] : []
+          const graceUpdates = Array.isArray(graceRes.result) ? graceRes.result as TelegramUpdate[] : []
           for (const u of graceUpdates) {
             const cbd = u.callback_query?.data
             if (cbd) {
@@ -1250,7 +1257,7 @@ function chunkByLength(text: string, maxLen: number) {
       sentLength: 0,
     })
 
-    let modelObj: any = undefined
+    let modelObj: { providerID: string; modelID: string } | undefined = undefined
     if (model) {
       const slash = model.indexOf("/")
       if (slash > 0) {
@@ -1264,10 +1271,10 @@ function chunkByLength(text: string, maxLen: number) {
       await client.session.prompt({
         path: { id: sessionId },
         body: {
-          parts: [{ type: "text", text: prompt }],
+          parts: [{ type: "text" as const, text: prompt }],
           model: modelObj,
         },
-      } as any)
+      })
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : summarizeError(err)
       await log(`runPrompt error sid=${sessionId}: ${errMsg}`)
@@ -1294,18 +1301,15 @@ function chunkByLength(text: string, maxLen: number) {
     await persistNow()
 
     if (item.sessionID && item.permissionID) {
-      const response = decision === "deny" ? "reject" : decision
-      const method = (client as any).postSessionIdPermissionsPermissionId
-      if (typeof method === "function") {
-        try {
-          await method.call(client, {
-            path: { id: item.sessionID, permissionID: item.permissionID },
-            body: { response },
-          })
-          await log(`permission.reply sent id=${id} session=${item.sessionID} permission=${item.permissionID} response=${response}`)
-        } catch (err) {
-          await log(`permission.reply error id=${id}: ${summarizeError(err)}`)
-        }
+      const response = decision === "deny" ? "reject" as const : decision
+      try {
+        await client.postSessionIdPermissionsPermissionId({
+          path: { id: item.sessionID, permissionID: item.permissionID },
+          body: { response },
+        })
+        await log(`permission.reply sent id=${id} session=${item.sessionID} permission=${item.permissionID} response=${response}`)
+      } catch (err) {
+        await log(`permission.reply error id=${id}: ${summarizeError(err)}`)
       }
     }
 
@@ -2124,15 +2128,11 @@ function chunkByLength(text: string, maxLen: number) {
             return
           }
           // 觸發 TUI 重新渲染，讓問題選單立即消失，不需要手動點擊
+          // NOTE: v1 SDK 使用 tui.showToast()（非 tui.toast.show()）
           try {
-            const clientAny = client as any
-            if (typeof clientAny.tui?.toast?.show === "function") {
-              await clientAny.tui.toast.show({ body: { message: `已選擇: ${answer}` } }).catch(() => undefined)
-            } else if (typeof clientAny.event?.send === "function") {
-              await clientAny.event.send({
-                body: { type: "tui.toast.show", properties: { message: `已選擇: ${answer}` } },
-              }).catch(() => undefined)
-            }
+            await client.tui.showToast({
+              body: { message: `已選擇: ${answer}`, variant: "info" },
+            }).catch(() => undefined)
           } catch { /* TUI toast 是非必要的，失敗不影響主流程 */ }
           await answerCallback(update.callback_query!.id, `✅ 已選擇: ${answer}`)
         } else {
@@ -2182,7 +2182,7 @@ function chunkByLength(text: string, maxLen: number) {
         state.lastPollOkAt = now()
         state.lastError = undefined
 
-        const updates = Array.isArray((res as any).result) ? (res as any).result as TelegramUpdate[] : []
+        const updates = Array.isArray(res.result) ? res.result as TelegramUpdate[] : []
         if (updates.length > 0) {
           await log(`poll: ${updates.length} updates, types=${updates.map(u => u.callback_query ? "callback" : u.message ? "msg" : "other").join(",")}`)
         }
@@ -2249,16 +2249,18 @@ function chunkByLength(text: string, maxLen: number) {
 
   return {
     async event({ event }) {
+      // 用 eventType 做字串比較，避免 TypeScript 對未知事件型別（如 question.*, permission.asked）報錯
+      const eventType = event?.type as string
       if (event?.type === "file.watcher.updated") {
-        const file = String((event as any)?.properties?.file ?? "")
+        const file = String(event.properties?.file ?? "")
         if (file.includes("tg-plugin")) return
       }
 
-      if (!quietEvents.has(event?.type as string)) {
-        await log(`event: ${event?.type}`)
+      if (!quietEvents.has(eventType)) {
+        await log(`event: ${eventType}`)
       }
 
-      if (event?.type === "permission.asked") {
+      if (eventType === "permission.asked") {
         await handlePermissionAsked(event).catch(err =>
           log(`permission.asked error: ${summarizeError(err)}`)
         )
@@ -2266,14 +2268,14 @@ function chunkByLength(text: string, maxLen: number) {
       }
 
       // ─ 新增：question.asked ──────────────────────────────────────────────
-      if (event?.type === "question.asked") {
+      if (eventType === "question.asked") {
         await handleQuestionAsked((event as any)?.properties ?? event).catch(err =>
           log(`question.asked error: ${summarizeError(err)}`)
         )
         return
       }
 
-      if (event?.type === "question.replied" || event?.type === "question.rejected") {
+      if (eventType === "question.replied" || eventType === "question.rejected") {
         const props = (event as any)?.properties ?? {}
         const requestID = props?.requestID
         if (requestID) {
@@ -2281,7 +2283,7 @@ function chunkByLength(text: string, maxLen: number) {
           const pq = clearPendingQuestion(requestID)
           if (pq) {
             await clearQuestionCards(pq.chatId, pq.messageIds ?? (pq.messageId ? [pq.messageId] : []))
-            await log(`question.${event.type === "question.replied" ? "replied" : "rejected"} cleanup requestID=${requestID} shortID=${shortID}`)
+            await log(`question.${eventType === "question.replied" ? "replied" : "rejected"} cleanup requestID=${requestID} shortID=${shortID}`)
           }
         }
         return
@@ -2290,7 +2292,7 @@ function chunkByLength(text: string, maxLen: number) {
       // ─ 新增：追蹤 subagent session ─────────────────────────────────────
       // session.created 時，若有 parentID，記錄為 subagent
       if (event?.type === "session.created" || event?.type === "session.updated") {
-        const info = (event as any)?.properties?.info ?? (event as any)?.properties
+        const info = event.properties?.info as any
         const sid = info?.id
         const parentID = info?.parentID ?? info?.parentId
         if (sid) {
@@ -2331,7 +2333,7 @@ if (!existing) {
       }
 
       if (event?.type === "session.compacted") {
-        const sid = (event as any)?.properties?.sessionID
+        const sid = event.properties?.sessionID
         if (sid) {
           await notifyCompactionEnd(sid).catch(err => log(`notifyCompactionEnd error sid=${sid}: ${summarizeError(err)}`))
           compactionTrackers.delete(sid)
@@ -2340,8 +2342,8 @@ if (!existing) {
       }
 
       if (event?.type === "session.status") {
-        const sid = (event as any)?.properties?.sessionID
-        const status = (event as any)?.properties?.status
+        const sid = event.properties?.sessionID
+        const status = event.properties?.status
         if (sid && status?.type === "busy") {
           await log(`session.status sid=${sid} busy`)
         }
@@ -2349,7 +2351,7 @@ if (!existing) {
 
       // session.idle: 任務完成
       if (event?.type === "session.idle") {
-        const sid = (event as any)?.properties?.sessionID ?? (event as any)?.properties?.id
+        const sid = event.properties?.sessionID
         if (sid) {
           const sessionRec = state.sessions.find(s => s.id === sid)
           const announceConversationEnd = Boolean(sessionRec && !sessionRec.parentID && isTGInitiatedSession(sid))
@@ -2374,7 +2376,7 @@ if (!existing) {
 
       // message.part.updated: 串流文字到 TG
       if (event?.type === "message.part.updated") {
-        const part = (event as any)?.properties?.part
+        const part = event.properties?.part
         if (part?.type === "text" && part?.sessionID) {
           const txt = (part?.text ?? "") as string
           if (txt) {
@@ -2386,8 +2388,8 @@ if (!existing) {
       }
 
       if (event?.type === "message.updated") {
-        const props = (event as any)?.properties ?? {}
-        const sessionID = props?.sessionID
+        const props = event.properties
+        const sessionID = (props as any)?.sessionID ?? (props?.info as any)?.sessionID
         const info = props?.info
         if (sessionID && info?.role === "assistant") {
           const tokens = info?.tokens ?? estimateTokensFromMessage(props)
@@ -2401,23 +2403,27 @@ if (!existing) {
 
       // session.error: 任務失敗
       if (event?.type === "session.error") {
-        const sid = (event as any)?.properties?.sessionID
-        const err = (event as any)?.properties?.error
+        const sid = event.properties?.sessionID
+        const err = event.properties?.error
         await log(`session.error sid=${sid}: ${summarizeError(err)}`)
         if (sid) runningSessions.delete(sid)
         if (sid) sessionInitiators.delete(sid) // 防止 sessionInitiators 無限增長
         if (sid) compactionTrackers.delete(sid)
-        const ss = sid ? streamStates.get(sid) : undefined
-        if (ss) {
-          streamStates.delete(sid)
-          await sendMsg(ss.chatId, `❌ 任務失敗\n${summarizeError(err).slice(0, 400)}`)
+        if (sid) {
+          const ss = streamStates.get(sid)
+          if (ss) {
+            streamStates.delete(sid)
+            await sendMsg(ss.chatId, `❌ 任務失敗\n${summarizeError(err).slice(0, 400)}`)
+          } else if (currentChatId) {
+            await sendMsg(currentChatId, `❌ 任務失敗\n${summarizeError(err).slice(0, 400)}`)
+          }
         } else if (currentChatId) {
           await sendMsg(currentChatId, `❌ 任務失敗\n${summarizeError(err).slice(0, 400)}`)
         }
       }
     },
 
-    async "permission.asked"(inputPermission, output) {
+    async "permission.asked"(inputPermission: any, output: any) {
       await handlePermissionAsked(inputPermission, output)
     },
 
