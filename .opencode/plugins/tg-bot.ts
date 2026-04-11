@@ -118,13 +118,14 @@ type SessionTokenSummary = {
 type StreamState = {
   chatId: number
   sessionId: string
-  buffer: string
-  messageId?: number
+  buffer: string        // cover 模式：最新文字快照；full 模式：當前正在編輯的訊息片段（≤ segmentSize）
+  fullBuffer: string    // full 模式專用：累積完整輸出文字
+  messageId?: number    // 當前正在 edit 的訊息 ID
   extraMessageIds: number[]  // 超過 4000 字後的延續訊息
   lastEditAt: number
   lastActivityAt: number
   done: boolean
-  sentLength?: number
+  sentLength?: number   // full 模式：已發送至 TG 的字元數（cumulative）
 }
 
 type PluginState = {
@@ -1072,42 +1073,56 @@ async function handleStreamPart(sessionId: string, text: string) {
       return
     }
 
-    const segmentSize = 1024
-    let pending = text.slice(ss.sentLength ?? 0)
-    if (!pending) return
+    // ── full 模式：追加輸出，每秒最多 edit 一次，超過段落上限則發新訊息 ──
+    // part.text 是累積式完整文字（每次事件都是從頭的完整輸出）
+    const segmentSize = 3800  // ≈ Telegram 單訊息上限，留安全邊界
 
-    while (pending.length > 0) {
-      if (!ss.messageId) {
-        const chunk = pending.slice(0, segmentSize)
-        const mid = await sendMsg(ss.chatId, chunk)
-        if (mid) {
-          ss.messageId = mid
-          ss.buffer = chunk
-        }
-        ss.sentLength = (ss.sentLength ?? 0) + chunk.length
-        pending = pending.slice(chunk.length)
-        continue
-      }
+    // 1. 累積完整文字到 fullBuffer（text 是累積式的完整文字快照）
+    if (text === ss.fullBuffer) return  // 沒有新內容
+    ss.fullBuffer = text
 
-      const room = segmentSize - ss.buffer.length
-      if (room > 0) {
-        const chunk = pending.slice(0, room)
-        ss.buffer += chunk
-        await editMsg(ss.chatId, ss.messageId, ss.buffer)
-        ss.sentLength = (ss.sentLength ?? 0) + chunk.length
-        pending = pending.slice(chunk.length)
-        continue
-      }
+    // 2. 速率限制：1 秒內只 edit 一次（避免 Telegram 429 Too Many Requests）
+    const nowMs = now()
+    if (nowMs - ss.lastEditAt < 1000) return
+    ss.lastEditAt = nowMs
 
-      const chunk = pending.slice(0, segmentSize)
+    // 3. 計算從 sentLength 起還沒有發出去的文字
+    const sentLen = ss.sentLength ?? 0
+    const unsent = ss.fullBuffer.slice(sentLen)
+    if (!unsent) return
+
+    // 4. 如果目前還沒有訊息，發第一則
+    if (!ss.messageId) {
+      const chunk = unsent.slice(0, segmentSize)
       const mid = await sendMsg(ss.chatId, chunk)
       if (mid) {
         ss.messageId = mid
         ss.buffer = chunk
+        ss.sentLength = sentLen + chunk.length
       }
-      ss.sentLength = (ss.sentLength ?? 0) + chunk.length
-      pending = pending.slice(chunk.length)
+      // sendMsg 失敗不推進 sentLength，下次會重試
+      return
     }
+
+    // 5. 當前訊息還有空間 → edit 更新
+    const room = segmentSize - ss.buffer.length
+    if (room > 0) {
+      const append = unsent.slice(0, room)
+      ss.buffer += append
+      await editMsg(ss.chatId, ss.messageId, ss.buffer)
+      ss.sentLength = sentLen + append.length
+      return
+    }
+
+    // 6. 當前訊息已滿 → 發新訊息（只發一段，剩餘的下次繼續）
+    const chunk = unsent.slice(0, segmentSize)
+    const mid = await sendMsg(ss.chatId, chunk)
+    if (mid) {
+      ss.messageId = mid
+      ss.buffer = chunk
+      ss.sentLength = sentLen + chunk.length
+    }
+    // sendMsg 失敗不推進 sentLength，下次會重試
 }
 
   async function handleStreamDone(sessionId: string, announceConversationEnd = false) {
@@ -1120,15 +1135,49 @@ async function handleStreamPart(sessionId: string, text: string) {
     // 清理 session initiator 記錄
     sessionInitiators.delete(sessionId)
 
-    const finalText = ss.buffer || "(任務完成，無文字回覆)"
+    // full 模式：用 fullBuffer 作為完整文字；cover 模式：用 buffer（最新快照）
+    const finalText = (state.streamMode === "full" ? ss.fullBuffer : ss.buffer) || "(任務完成，無文字回覆)"
     let chunkCount = 0
     if (state.streamMode === "full") {
-      if (ss.messageId) {
-        await editMsg(ss.chatId, ss.messageId, finalText)
+      // flush 尚未發出的文字（streaming 中因速率限制而跳過的部分）
+      const sentLen = ss.sentLength ?? 0
+      const unsent = finalText.slice(sentLen)
+
+      if (!unsent) {
+        // 所有內容已在 streaming 中發出，只需更新最後一則訊息即可（確保顯示完整）
+        if (ss.messageId) {
+          await editMsg(ss.chatId, ss.messageId, ss.buffer)
+        } else {
+          // streaming 期間沒有任何訊息發出（極罕見），現在才發
+          await sendMsg(ss.chatId, finalText)
+        }
       } else {
-        await sendMsg(ss.chatId, finalText)
+        // 還有未發出的文字：先補滿當前訊息，剩餘的分段發新訊息
+        const segmentSize = 3800
+        let remaining = unsent
+        if (ss.messageId && ss.buffer.length < segmentSize) {
+          const room = segmentSize - ss.buffer.length
+          const fill = remaining.slice(0, room)
+          ss.buffer += fill
+          await editMsg(ss.chatId, ss.messageId, ss.buffer)
+          remaining = remaining.slice(fill.length)
+        } else if (!ss.messageId) {
+          // 從未發出過任何訊息，直接用 splitText 發完整內容
+          const allChunks = splitText(finalText)
+          for (const chunk of allChunks) {
+            if (chunk) await sendMsg(ss.chatId, chunk)
+          }
+          chunkCount = allChunks.length
+          // remaining 已全部處理，跳過下面的 extraChunks 發送
+          remaining = ""
+        }
+        // 剩餘部分分段 sendMsg
+        const extraChunks = splitText(remaining)
+        for (const chunk of extraChunks) {
+          if (chunk) await sendMsg(ss.chatId, chunk)
+        }
       }
-      chunkCount = chunkByLength(finalText, 1024).length
+      chunkCount = splitText(finalText).length
     } else {
       const chunks = splitText(finalText)
       chunkCount = chunks.length
@@ -1250,6 +1299,7 @@ function chunkByLength(text: string, maxLen: number) {
       chatId,
       sessionId,
       buffer: "",
+      fullBuffer: "",
       messageId: progressMsgId,
       extraMessageIds: [],
       lastEditAt: now(),
