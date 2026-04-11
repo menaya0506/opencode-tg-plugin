@@ -612,6 +612,7 @@ let watchdogIntervalId: ReturnType<typeof setInterval> | undefined
             id: item?.id,
             title: item?.title,
             createdAt: Number(item?.createdAt ?? now()),
+            parentID: item?.parentID ?? item?.parentId,
           }))
           .filter((s: SessionRecord) => s.id)
       }
@@ -1917,11 +1918,12 @@ function chunkByLength(text: string, maxLen: number) {
     if (t === "/session list") {
       const sessions = await listSessions()
       const current = resolveSession(chatId)
-      const lines = sessions.map(s => {
-        const isCurrent = s.id === current ? "▶ " : "  "
-        const sub = s.parentID ? " [sub]" : ""
-        return `${isCurrent}${s.id}${sub}${s.title ? ` (${s.title})` : ""}`
-      })
+      const lines = sessions
+        .filter(s => !s.parentID)
+        .map(s => {
+          const isCurrent = s.id === current ? "▶ " : "  "
+          return `${isCurrent}${s.id}${s.title ? ` (${s.title})` : ""}`
+        })
       await sendMsg(chatId, lines.length ? lines.join("\n") : "(無 session)")
       return
     }
